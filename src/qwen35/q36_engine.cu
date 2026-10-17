@@ -1686,13 +1686,13 @@ struct Engine {
             CK(cudaMemGetInfo(&fr0, &tot0));
             // the sessions would not fit beside the packed Q8_0 decode copies (the old order failed here: --kv int8 at
             // 131072+ cells on 8 GB) and place_experts may give them back (MMQ, no --expert-slots / --expert-vram,
-            // STRATA_Q36_KEEP_PACKED unset): give them back first.  Every config that fit before allocates as before: one
-            // session with no margin (what follows it here is a few KB; a session that fits with less than 64 MiB to
-            // spare still gives them back in place_experts, for the staging buffers), several with the 1 GiB the check
-            // below asks for.
+            // STRATA_Q36_KEEP_PACKED unset): give them back first.  Only under --kv int8 (an FP32 store keeps the old
+            // order and its failure).  Every config that fit before allocates as before: one session with no margin (what
+            // follows it here is a few KB; a session that fits with less than 64 MiB to spare still gives them back in
+            // place_experts, for the staging buffers), several with the 1 GiB the check below asks for.
             const size_t sess_need = per * (size_t) n_sess + (vision ? (size_t) ctx * 12 : 0) +
                                      (n_sess > 1 ? ((size_t) 1 << 30) : 0);
-            if (sess_need > fr0 && packed_droppable && use_mmq && !model.packed.empty()) {
+            if (sess_need > fr0 && (kv_k8 || kv_v8) && packed_droppable && use_mmq && !model.packed.empty()) {
                 const size_t pb = give_back_packed(model);
                 const size_t fr_was = fr0;
                 CK(cudaMemGetInfo(&fr0, &tot0));
