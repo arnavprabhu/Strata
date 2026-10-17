@@ -1395,6 +1395,11 @@ struct Engine {
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
         std::vector<int32_t> live;          // the tokens whose state it holds (cell i = live[i])
         std::vector<ImgKey> imgs;           // the pictures among them
+        // STRATA_Q36_TURN_CKPT=1: the recurrent state after live[0, ck_n) (a prompt's last <|im_start|>), in pinned host
+        // memory; valid while live starts with those tokens (its attention cells below ck_n are then still theirs)
+        int64_t ck_n = 0;
+        int32_t ck_rdelta = 0;
+        void* ck_host = nullptr;
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
     };
@@ -2738,7 +2743,7 @@ struct Engine {
     /// token's logits stay in `logits` (its greedy pick in `pick`), hlast its normed hidden.  With the MTP block the
     /// prompt also runs through it (its K / V for every position: row q reads h_{q-1} and token q).  on_chunk(done) runs
     /// after every chunk; false ends the read there (a cancelled request): the tokens processed are returned.
-    template <class F> int64_t process(const int32_t* toks, int64_t n, F on_chunk_) {
+    template <class F> int64_t process(const int32_t* toks, int64_t n, F on_chunk_, bool rebal = true) {
         const int N = (int) m->g.n_embd;
         auto on_chunk = [&](int64_t done) -> bool {   // a callback returning void never cancels
             if constexpr (std::is_void_v<decltype(on_chunk_(done))>) {
@@ -2795,7 +2800,7 @@ struct Engine {
                 return i + T;
             }
         }
-        if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+        if (m->hybrid && rebal) rebalance(hybrid_swaps_after_prompt);
         return n;
     }
 
@@ -3000,9 +3005,50 @@ struct Engine {
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
+        b.ck_n = 0;
         if (dst == cur) load_cur();
     }
     int hybrid_swaps_after_prompt = 2048;
+    // STRATA_Q36_TURN_CKPT=1 (opt-in): a prompt is read to its last <|im_start|>, the recurrent state there (each GDN
+    // layer's conv and S, hlast: ~63 MiB for Qwen3.6-35B-A3B) is copied to pinned host memory, then the new turn's header
+    // is read.  The next turn of the chat re-renders that history the same way but not the header and the answer (the
+    // template drops the empty <think></think> of earlier answers), so it resumes there instead of reading from token 0.
+    bool turn_ckpt = false;
+    void ckpt_copy(bool save) {
+        Sess& ss = sess[(size_t) cur];
+        const auto& g = m->g;
+        const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4;
+        const size_t sb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
+        if (!ss.ck_host) {
+            size_t bytes = (size_t) g.n_embd * 4;
+            for (float* c : conv) bytes += c ? cb + sb : 0;
+            CK(cudaHostAlloc(&ss.ck_host, bytes, cudaHostAllocDefault));
+        }
+        char* h = (char*) ss.ck_host;
+        auto cp = [&](void* d, size_t n) {
+            CK(cudaMemcpyAsync(save ? (void*) h : d, save ? d : (void*) h, n,
+                               save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, st));
+            h += n;
+        };
+        for (size_t l = 0; l < conv.size(); ++l)
+            if (conv[l]) { cp(conv[l], cb); cp(S[l], sb); }
+        cp(hlast, (size_t) g.n_embd * 4);
+        CK(cudaStreamSynchronize(st));
+    }
+    /// The current session's state after its first n cells becomes its checkpoint.
+    void ckpt_save(int64_t n) {
+        ckpt_copy(true);
+        sess[(size_t) cur].ck_n = n;
+        sess[(size_t) cur].ck_rdelta = sess[(size_t) cur].rdelta;
+    }
+    /// The current session goes back to its checkpoint (the caller cuts `live` to ck_n).
+    void ckpt_load() {
+        Sess& ss = sess[(size_t) cur];
+        ckpt_copy(false);
+        pos = ss.ck_n;
+        ss.pos = pos;
+        set_delta(ss.ck_rdelta);
+    }
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
@@ -3014,7 +3060,7 @@ struct Engine {
     /// stopped mid-answer leaves the state at the tokens it has shown: a conversation that continues from them (the server's
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const std::function<int32_t(int)>* repick = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -3064,7 +3110,15 @@ struct Engine {
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        if (repick != nullptr) {   // greedy with penalties: each row's pick from its penalized logits (row r: after x, d1 .. dr)
+            for (;;) {
+                hpin[2 + a] = (*repick)(a);
+                if (a == D || hpin[2 + a] != drafts[(size_t) a]) break;
+                ++a;
+            }
+        } else {
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        }
         if (cancel != nullptr && cancel->load()) a = 0;
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         commit(a + 1);
@@ -3494,6 +3548,7 @@ std::vector<int32_t> parse_ids(const char* s) {
 }
 
 bool is_eos(int t) { return t == 248044 || t == 248046; }
+constexpr int32_t kImStart = 248045;   // <|im_start|>: a turn boundary (STRATA_Q36_TURN_CKPT)
 
 // ------------------------------------------------------------------------------------------------ pictures
 constexpr int32_t kImagePad = 248056;   // <|image_pad|>
@@ -3836,6 +3891,16 @@ struct Serve {
         return in_live == ss.imgs ? L : 0;
     }
 
+    /// STRATA_Q36_TURN_CKPT: the length of session ss's checkpoint when its tokens are a proper start of `ids` and no
+    /// picture is involved, else 0.
+    size_t ck_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+        const size_t c = (size_t) ss.ck_n;
+        if (!E.turn_ckpt || c == 0 || c >= ids.size() || ss.live.size() < c || !ss.imgs.empty()) return 0;
+        for (const ImgKey& k : imgs)
+            if (k.cell < (int64_t) c) return 0;
+        return std::equal(ss.live.begin(), ss.live.begin() + (long) c, ids.begin()) ? c : 0;
+    }
+
     /// The session a request alone takes: the one holding the longest start of its prompt, else an empty one, else the
     /// least recently used (never a decoding slot).
     int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
@@ -3844,7 +3909,7 @@ struct Serve {
         for (int i = 0; i < E.n_sess; ++i) {
             const Engine::Sess& ss = E.sess[(size_t) i];
             if (ss.active) continue;
-            const size_t l = match_len(ss, ids, imgs);
+            const size_t l = std::max(match_len(ss, ids, imgs), ck_len(ss, ids, imgs));
             if (l > bl) { bl = l; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
             if (lru < 0 || ss.used < E.sess[(size_t) lru].used) lru = i;
@@ -3958,17 +4023,33 @@ struct Serve {
             }
         }
         E.select(s);
+        if (!adm && reuse == 0) {   // STRATA_Q36_TURN_CKPT: the held answer is not this prompt's, its turn boundary is
+            const size_t c = ck_len(ss, ids, ir.imgs);
+            if (c > 0) {
+                E.ckpt_load();
+                ss.live.resize(c);
+                reuse = c;
+            }
+        }
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
+            ss.ck_n = 0;
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+        int64_t split = 0;   // STRATA_Q36_TURN_CKPT: the fresh tokens before the prompt's last <|im_start|> (0: no split)
+        if (E.turn_ckpt && !adm && ir.imgs.empty()) {
+            for (int64_t i = fresh - 1; i > 0; --i)
+                if (ids[reuse + (size_t) i] == kImStart) { split = i; break; }
+            // both parts take the chunked read (a 1-token part would take the decode step: no MTP rows, no rebalance)
+            if (split < 2 || fresh - split < 2) split = 0;
+        }
+        auto on_read = [&](int64_t done) -> bool {
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
@@ -3981,7 +4062,18 @@ struct Serve {
             }
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
-        });
+        };
+        int64_t got;
+        if (split == 0) {
+            got = E.process(ids.data() + reuse, fresh, on_read);
+        } else {
+            got = E.process(ids.data() + reuse, split, on_read, false);
+            if (got == split && !cancelled) {
+                E.ckpt_save((int64_t) reuse + split);
+                got += E.process(ids.data() + reuse + split, fresh - split,
+                                 [&](int64_t done) -> bool { return on_read(split + done); });
+            }
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -3992,6 +4084,7 @@ struct Serve {
         if (cancelled && cut) {   // stopped inside a picture: the state cannot be continued, the next read starts over
             ss.live.clear();
             ss.imgs.clear();
+            ss.ck_n = 0;
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
@@ -4008,9 +4101,21 @@ struct Serve {
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); sampled ones, and requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        // opt-in (STRATA_Q36_PENALTY_SPEC=1): greedy requests WITH penalties (the model card's presence_penalty 1.5) also
+        // take the speculative steps; every verify row is picked on the host from its penalized logits, as one token at a time
+        static const bool pen_spec_env = std::getenv("STRATA_Q36_PENALTY_SPEC") != nullptr &&
+                                         std::string(std::getenv("STRATA_Q36_PENALTY_SPEC")) != "0";
+        const bool pen_spec = pen_spec_env && smp.needs_logits() && smp.temperature <= 0.f;
+        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || pen_spec) && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        bool decided = false;   // nx came from a speculative step's (penalized) row: not sampled again at the loop's top
+        const std::function<int32_t(int)> repick = [&](int r) -> int32_t {
+            E.host_logits_row(r, lg);
+            std::vector<int32_t> h = hist;   // hist ends with x; row r follows drafts 0 .. r - 1 too
+            for (int i = 0; i < r; ++i) h.push_back(drafts[(size_t) i]);
+            return (int32_t) sample(lg, smp, h, rng);
+        };
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
             if (smp.needs_logits()) {
@@ -4047,10 +4152,11 @@ struct Serve {
             return;
         }
         for (;;) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() && !decided) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
+            decided = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
@@ -4064,7 +4170,7 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, pen_spec ? &repick : nullptr);
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -4079,6 +4185,7 @@ struct Serve {
                     if (!emit(drafts[(size_t) i])) ended = true;
                 if (ended) break;
                 nx = picks[a];
+                decided = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
@@ -4150,6 +4257,10 @@ struct Serve {
 };
 
 int serve(Engine& E) {
+    if (const char* v = std::getenv("STRATA_Q36_TURN_CKPT")) E.turn_ckpt = std::atoi(v) != 0;
+    if (E.turn_ckpt)
+        std::fprintf(stderr, "strata serve: STRATA_Q36_TURN_CKPT=1: a prompt's last turn boundary keeps the recurrent state "
+                             "(pinned host memory), so the next turn of the chat resumes there\n");
     Serve sv(E);
     return sv.run();
 }
