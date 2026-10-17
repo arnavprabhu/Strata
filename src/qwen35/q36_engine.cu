@@ -548,6 +548,63 @@ __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) att[i] *= sigm(gate[i]);
 }
+// ---- the prompt attention over the context in blocks of cells (Engine::kv16_blk: an int8 K / V store at a long
+// context): the FP16 K / V hold one block, so the softmax runs online over the blocks (flash attention's running max
+// and sum, here between cuBLAS GEMMs)
+/// k_kv_f16 for cells [c0, c0 + n) of each KV head into compact [kvh][n][HD] halves (the same rounding; KI8 / VI8: the
+/// codes dequantized with their group's FP16 scale, see kKVG).  grid1(HKV * n * HD).
+template <bool KI8, bool VI8>
+__global__ void k_kv_f16_blk(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int c0, int n, int HD,
+                             int HKV) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) HKV * n * HD) return;
+    const int64_t per = (int64_t) n * HD;
+    const int64_t kvh = i / per, rest = i % per;
+    const int64_t p = c0 + rest / HD, d = rest % HD;
+    const size_t src = ((size_t) kvh * ctx + p) * HD + d;
+    const size_t si = ((size_t) kvh * ctx + p) * (HD / kKVG) + d / kKVG;
+    if constexpr (KI8) k16[i] = __float2half(__half2float(kv8_scales(kc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) kc)[src]);
+    else k16[i] = __float2half(kc[src]);
+    if constexpr (VI8) v16[i] = __float2half(__half2float(kv8_scales(vc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) vc)[src]);
+    else v16[i] = __float2half(vc[src]);
+}
+/// One block of cells [c0, c0 + n) of the online causal softmax: row (h, t) of S (ld floats) -> FP16 exp(S * scale - M)
+/// over the cells <= pos0 + t, 0 past them, M the running max of the row over this block and the ones before (am); the
+/// running sum (al) and the output so far (O row t * H + h, HD floats: P V of the blocks before) rescaled to M.  The
+/// first block starts them (its P V GEMM writes O with beta 0).  grid (T, H), block 256.
+__global__ void k_attn_softmax16_blk(const float* S, __half* S16, int ld, int T, int n, int c0, int pos0, float scale,
+                                     float* am, float* al, float* O, int H, int HD, int first) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y;
+    const float* row = S + ((size_t) h * T + t) * ld;
+    __half* out = S16 + ((size_t) h * T + t) * ld;
+    const int nv = max(0, min(n, pos0 + t + 1 - c0));
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < nv; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
+    mx = block_max(mx, sh);
+    const size_t r = (size_t) t * H + h;
+    const float m_old = first ? -INFINITY : am[r], l_old = first ? 0.f : al[r];
+    const float m_new = fmaxf(m_old, mx);   // finite: the first block holds cell 0, which every row sees
+    const float corr = first ? 0.f : expf(m_old - m_new);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) {
+        const __half v = __float2half(p < nv ? expf(row[p] * scale - m_new) : 0.f);
+        out[p] = v;
+        sum += __half2float(v);
+    }
+    sum = block_sum(sum, sh);
+    if (!first && corr != 1.f)
+        for (int i = threadIdx.x; i < HD; i += blockDim.x) O[r * HD + i] *= corr;
+    if (threadIdx.x == 0) {
+        am[r] = m_new;
+        al[r] = l_old * corr + sum;
+    }
+}
+/// att *= sigmoid(gate) / l (the online softmax's sum, one per row of hd values), n values.
+__global__ void k_gate_mul_l(float* att, const float* gate, const float* l, int hd, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) att[i] *= sigm(gate[i]) / l[i / hd];
+}
 
 /// Picture rows over the embeddings of a chunk: x[r] = img[map[r]] for the rows with map[r] >= 0 (the rows of a picture's
 /// <|image_pad|> cells).  grid (T), block 256.
@@ -1214,6 +1271,19 @@ void expert_blob(const Layer& L, int64_t e, uint8_t* dst) {
 }
 
 // ------------------------------------------------------------------------------------------------ the engine
+/// The packed Q8_0 decode copies given back (the decode reads the GGUF layout then, bitwise the same outputs): their bytes.
+size_t give_back_packed(Model& m) {
+    size_t bytes = 0;
+    CK(cudaDeviceSynchronize());
+    for (const auto& pk : m.packed) {
+        K::native_q8_0_packed_unregister(std::get<0>(pk));
+        CK(cudaFree(std::get<1>(pk)));
+        bytes += std::get<2>(pk);
+    }
+    m.packed.clear();
+    return bytes;
+}
+
 float* dalloc(size_t n) {
     float* p = nullptr;
     CK(cudaMalloc(&p, n * 4));
@@ -1270,9 +1340,24 @@ struct Engine {
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
     static constexpr int kSplitK = 16;
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
+    size_t sk_cap = 0;                 // sk_part's floats
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
+    // the FP16 K / V above hold kv16_blk cells instead of the whole context (0: the context; an int8 K / V store (--kv) at
+    // a context above 16384 cells, STRATA_Q36_KV16_BLOCK=cells sets it, 0 off): a longer prompt's attention then runs
+    // block by block
+    int kv16_blk = 0;
+    float *att_m = nullptr, *att_l = nullptr;   // [tmax][n_head] the blocked attention's running max / sum
+    static int kv16_block_cells(bool kv_i8, int ctx) {
+        const char* kb = std::getenv("STRATA_Q36_KV16_BLOCK");
+        int blk = kb ? std::atoi(kb) : (kv_i8 ? 16384 : 0);
+        if (blk > 0) blk = std::max(256, std::min(1 << 20, blk) / 8 * 8);   // (a block's scores row fits the 64 MB buffer)
+        return blk > 0 && blk < ctx ? blk : 0;
+    }
+    // the packed Q8_0 decode copies may be given back before the sessions when those would not fit beside them (no
+    // --expert-slots / --expert-vram, STRATA_Q36_KEEP_PACKED unset: set by main), as place_experts gives them back later
+    bool packed_droppable = false;
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -1341,7 +1426,9 @@ struct Engine {
 
     // ---- the hybrid mode (Model::hybrid): per state index (the layers, then the MTP block) the slot tables; a
     // batch of up to hybrid_t rows runs its VRAM-resident experts on the GPU and the others on the CPU pool, side by
-    // side; a bigger prompt chunk streams each layer's experts into a staging buffer for MMQ (two, double-buffered)
+    // side; a bigger prompt chunk streams each layer's experts into a staging buffer for MMQ (double-buffered by
+    // default: one layer streams while the other computes; STRATA_Q36_SINGLE_STAGE=1, or an int8 K / V store (--kv) where
+    // the pair does not fit, one buffer)
     struct Hy {
         std::vector<int> slot_of, exp_in_slot;
         std::vector<double> score;   // routing counts, halved at each rebalance
@@ -1369,6 +1456,7 @@ struct Engine {
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};
+    int n_stage = 2;   // staging buffers: 2 double-buffered, or 1 (STRATA_Q36_SINGLE_STAGE=1, or --kv int8 short of VRAM)
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -1445,7 +1533,7 @@ struct Engine {
         CK(cudaStreamSynchronize(st));   // (the pinned word is reused)
     }
 
-    void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
+    void init(Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
         m = &model;
         ctx = ctx_;
         n_sess = std::max(1, std::min(n_sessions, kVerify));
@@ -1480,13 +1568,25 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
             std::exit(1);
         }
+        const bool kv_i8 = kv_k8 || kv_v8;   // an int8 K / V store (--kv): the long-context buffers below
         att_s = dalloc(kAttScoreFloats);
-        sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
+        // f32mm's split-K partials: splits <= 128 / (gx * gy) with gy >= T / (16 * tm), so splits * T <= 2048 * tm (tm <= 4)
+        // as well as kSplitK * T; --kv int8 sizes them by that bound (8.0 MiB instead of 32.1 at a 2048 chunk)
+        sk_cap = (kv_i8 ? std::min<size_t>((size_t) kSplitK * T, 2048 * 4) : (size_t) kSplitK * T) * (g.n_expert + 1);
+        sk_part = dalloc(sk_cap);
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
-        k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-        v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+        kv16_blk = kv16_block_cells(kv_i8, ctx);
+        const size_t kv16_cells = kv16_blk > 0 ? (size_t) kv16_blk : (size_t) ctx;
+        k16 = dalloc_t<__half>((size_t) g.n_head_kv * kv16_cells * g.head_dim);
+        v16 = dalloc_t<__half>((size_t) g.n_head_kv * kv16_cells * g.head_dim);
+        if (kv16_blk > 0) {
+            att_m = dalloc(T * g.n_head);
+            att_l = dalloc(T * g.n_head);
+        }
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
+        const char* singlestage = std::getenv("STRATA_Q36_SINGLE_STAGE");
+        n_stage = (singlestage && std::atoi(singlestage) > 0) ? 1 : 2;   // one staging buffer instead of two: halves the prompt staging VRAM
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
                    MMQ::fits(L.L.d_type, g.n_embd);
@@ -1506,8 +1606,16 @@ struct Engine {
             MMQ::iota(ident, ne, st);
             CK(cudaMalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
             CK(cudaMalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
-            mq_gu = dalloc((size_t) ne * 2 * FF);
-            mq_h = dalloc((size_t) ne * FF);
+            if (kv_i8 && 3 * FF <= N) {
+                // --kv int8: gate+up ([ne][2 FF]) and the SwiGLU ([ne][FF]) in the expert outputs' rows (eparts, [ne][N]):
+                // all three are on the one stream, the down product writes eparts after the SwiGLU's quantize read mq_h,
+                // and nothing reads eparts between the combine and the next layer's down (96 MiB less at a 2048 chunk)
+                mq_gu = eparts;
+                mq_h = eparts + (size_t) ne * 2 * FF;
+            } else {
+                mq_gu = dalloc((size_t) ne * 2 * FF);
+                mq_h = dalloc((size_t) ne * FF);
+            }
         }
         std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
         {
@@ -1542,6 +1650,9 @@ struct Engine {
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
+        // (--kv int8: kGemmT, the most rows the split-K path ever runs - a longer batch takes the GEMM path -: the
+        // partials are 4 KB per cell at 64, 0.78 GiB at 204800 cells, 1/8 of that at kGemmT)
+        if (kv_i8) att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kGemmT));
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
@@ -1573,6 +1684,23 @@ struct Engine {
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
             size_t fr0 = 0, tot0 = 0;
             CK(cudaMemGetInfo(&fr0, &tot0));
+            // the sessions would not fit beside the packed Q8_0 decode copies (the old order failed here: --kv int8 at
+            // 131072+ cells on 8 GB) and place_experts may give them back (MMQ, no --expert-slots / --expert-vram,
+            // STRATA_Q36_KEEP_PACKED unset): give them back first.  Every config that fit before allocates as before: one
+            // session with no margin (what follows it here is a few KB; a session that fits with less than 64 MiB to
+            // spare still gives them back in place_experts, for the staging buffers), several with the 1 GiB the check
+            // below asks for.
+            const size_t sess_need = per * (size_t) n_sess + (vision ? (size_t) ctx * 12 : 0) +
+                                     (n_sess > 1 ? ((size_t) 1 << 30) : 0);
+            if (sess_need > fr0 && packed_droppable && use_mmq && !model.packed.empty()) {
+                const size_t pb = give_back_packed(model);
+                const size_t fr_was = fr0;
+                CK(cudaMemGetInfo(&fr0, &tot0));
+                std::fprintf(stderr, "strata-q36: the sessions' K / V and state (%.2f GiB at a context of %d) do not fit in the "
+                             "%.2f GiB free: the packed Q8_0 decode copies (%.2f GiB) given back before them, %.2f GiB free "
+                             "now (STRATA_Q36_KEEP_PACKED=1 keeps them)\n", (double) per * n_sess / (1 << 30), ctx,
+                             (double) fr_was / (1 << 30), (double) pb / (1 << 30), (double) fr0 / (1 << 30));
+            }
             if (n_sess > 1)
                 std::fprintf(stderr, "strata-q36: %d sessions (--batch): %.2f GiB of VRAM each at a context of %d (%.2f GiB in "
                              "all), %.2f GiB free before them\n", n_sess, (double) per / (1 << 30), ctx,
@@ -1623,6 +1751,13 @@ struct Engine {
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+        if (kv16_blk > 0)
+            std::fprintf(stderr, "strata-q36: the prompt attention over the context in blocks of %d cells: its FP16 K / V "
+                         "%.3f GiB instead of %.3f GiB (STRATA_Q36_KV16_BLOCK=0: the whole context); split-K partials for "
+                         "%d rows, %.3f GiB\n", kv16_blk,
+                         (double) (2 * g.n_head_kv * g.head_dim * 2) * kv16_blk / (1 << 30),
+                         (double) (2 * g.n_head_kv * g.head_dim * 2) * ctx / (1 << 30), att_rows / (int) g.n_head,
+                         (double) att_rows * n_chunk * (g.head_dim + 2) * 4 / (1 << 30));
     }
 
     /// The recurrent state and the cache to a fresh sequence.
@@ -1660,12 +1795,15 @@ struct Engine {
             const int want = std::max(1, std::min(kSplitK, 128 / std::max(1, gx * gy)));
             const int kz = (n_in / want + 15) / 16 * 16;
             const int splits = (n_in + kz - 1) / kz;
-            float* dst = splits > 1 ? sk_part : out;
-            if (tm == 4) k_sgemm_nt<4><<<dim3(gx, gy, splits), 256, 0, st>>>(W, xin, dst, n_in, n_out, T, n_out, kz);
-            else k_sgemm_nt<1><<<dim3(gx, gy, splits), 256, 0, st>>>(W, xin, dst, n_in, n_out, T, n_out, kz);
-            if (splits > 1)
-                k_sum_splits<<<grid1((int64_t) T * n_out), kThreads, 0, st>>>(sk_part, out, (int64_t) T * n_out, splits);
-            return;
+            // (--kv int8 sizes sk_part by a bound, see init: outside it, never with this model's shapes, cuBLAS below)
+            if (splits <= 1 || (size_t) splits * T * n_out <= sk_cap) {
+                float* dst = splits > 1 ? sk_part : out;
+                if (tm == 4) k_sgemm_nt<4><<<dim3(gx, gy, splits), 256, 0, st>>>(W, xin, dst, n_in, n_out, T, n_out, kz);
+                else k_sgemm_nt<1><<<dim3(gx, gy, splits), 256, 0, st>>>(W, xin, dst, n_in, n_out, T, n_out, kz);
+                if (splits > 1)
+                    k_sum_splits<<<grid1((int64_t) T * n_out), kThreads, 0, st>>>(sk_part, out, (int64_t) T * n_out, splits);
+                return;
+            }
         }
         const float one = 1.0f, zero = 0.0f;
         if (cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, n_out, T, n_in, &one, W, n_in, xin, n_in, &zero, out, n_out) !=
@@ -2066,6 +2204,53 @@ struct Engine {
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
+                if (kv16_blk > 0 && P > kv16_blk) {
+                    // more cells than the FP16 K / V hold (kv16_blk): block by block, each block's K / V converted once;
+                    // per block and query slice its scores, the online softmax (k_attn_softmax16_blk: FP16 exp relative to
+                    // the row's running max, the output so far rescaled) and out += P V; the sum divides out with the gate
+                    const int ldb = (kv16_blk + 7) / 8 * 8;
+                    const int tqb = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldb))));
+                    k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
+                    for (int c0 = 0; c0 < P; c0 += kv16_blk) {
+                        const int nb = std::min(kv16_blk, P - c0);
+                        kv4([&](auto k8c, auto v8c) {
+                            constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
+                            k_kv_f16_blk<K8, V8><<<grid1((int64_t) HKV * nb * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16,
+                                                                                                    ctx, c0, nb, HD, HKV);
+                        });
+                        for (int t0 = 0; t0 < T; t0 += tqb) {
+                            const int nt = std::min(tqb, T - t0);
+                            for (int kvh = 0; kvh < HKV; ++kvh) {
+                                const __half* Kh = k16 + (size_t) kvh * nb * HD;
+                                const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
+                                float* Sh = att_s + (size_t) kvh * G * nt * ldb;
+                                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, nb, nt, HD, &one, Kh, CUDA_R_16F,
+                                                               HD, 0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldb,
+                                                               (long long) nt * ldb, G, CUBLAS_COMPUTE_32F,
+                                                               CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                                    std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                                    std::exit(1);
+                                }
+                            }
+                            k_attn_softmax16_blk<<<dim3(nt, H), kThreads, 0, st>>>(
+                                att_s, att_p16, ldb, nt, nb, c0, (int) p0 + t0, 1.0f / sqrtf((float) HD), att_m + (size_t) t0 * H,
+                                att_l + (size_t) t0 * H, att + (size_t) t0 * H * HD, H, HD, c0 == 0);
+                            for (int kvh = 0; kvh < HKV; ++kvh) {
+                                const __half* Vh = v16 + (size_t) kvh * nb * HD;
+                                const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldb;
+                                float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
+                                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, nb, &one, Vh, CUDA_R_16F,
+                                                               HD, 0, Sh, CUDA_R_16F, ldb, (long long) nt * ldb,
+                                                               c0 == 0 ? &zero : &one, Oh, CUDA_R_32F, H * HD, HD, G,
+                                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                                    std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
+                                    std::exit(1);
+                                }
+                            }
+                        }
+                    }
+                    k_gate_mul_l<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, att_l, HD, (int64_t) T * H * HD);
+                } else {
                 kv4([&](auto k8c, auto v8c) {
                     constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
                     k_kv_f16<K8, V8><<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
@@ -2101,6 +2286,7 @@ struct Engine {
                     }
                 }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                }
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
@@ -2286,14 +2472,14 @@ struct Engine {
     // ---- the hybrid mode
     const Layer& layer_at(int li) const { return li < (int) m->layers.size() ? m->layers[(size_t) li] : m->mtp; }
 
-    /// A streamed forward over the state indices `seq`: the first two layers' experts start copying now.
+    /// A streamed forward over the state indices `seq`: the first n_stage layers' experts start copying now.
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
         stream_pos = 0;
-        for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
+        for (int i = 0; i < n_stage && i < (int) seq.size(); ++i) stream_kick(i);
     }
-    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
-        const int b = i % 2;
+    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % n_stage, after its last reader
+        const int b = i % n_stage;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
@@ -2331,14 +2517,14 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: the expert stream is out of step (layer %d)\n", li);
             std::exit(1);
         }
-        const int b = stream_pos % 2;
+        const int b = stream_pos % n_stage;
         CK(cudaStreamWaitEvent(st, ev_copy[b], 0));
         return stage[b];
     }
     void stream_done() {
-        const int b = stream_pos % 2;
+        const int b = stream_pos % n_stage;
         CK(cudaEventRecord(ev_used[b], st));
-        if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
+        if (stream_pos + n_stage < (int) stream_seq.size()) stream_kick(stream_pos + n_stage);
         ++stream_pos;
     }
 
@@ -2931,7 +3117,8 @@ struct Engine {
 // ------------------------------------------------------------------------------------------------ expert placement
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
 /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
-/// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
+/// batch's other experts on the CPU pool and a prompt chunk's streamed through staging buffers (double-buffered, or
+/// one with STRATA_Q36_SINGLE_STAGE=1 or an int8 K / V store short of VRAM).
 bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, std::string& err) {
     const auto t0 = Clock::now();
     const auto& g = m.g;
@@ -2964,7 +3151,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // and CPU-output scratch, even with no expert slots. Keep the same reserve as the placement budget below.
     const size_t hybrid_scratch = (size_t) E.tmax * (size_t) m.top_k * ((size_t) g.n_embd + 1) * 4;
     const bool staging_short = E.use_mmq && total > budget &&
-                              2 * (max_layer + kMmqTail) + hybrid_scratch + reserve > fr;
+                              (size_t) E.n_stage * (max_layer + kMmqTail) + hybrid_scratch + reserve > fr;
     if (slots <= 0 && vram_gib < 0 && total > budget && packed_bytes > 0 &&
         (total <= budget + packed_bytes || (mtp_cpu_ok && main_need <= budget + packed_bytes + slack) || staging_short) &&
         std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr) {
@@ -3040,11 +3227,92 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    const bool kv_i8 = E.kv_k8 || E.kv_v8;   // an int8 K / V store (--kv): the long-context trades below
+    // the rows the CPU pool's outputs (ecpu) and the native grouped experts' scratch (escr) serve: a hybrid batch of up to
+    // hybrid_t rows, or a decode / verify batch of kGemmT; with the main layers hybrid and MMQ every bigger batch is a
+    // streamed prompt chunk, which uses neither (the MTP-only placement runs every MTP batch on the pool: all rows).
+    // --kv int8 sizes both by that instead of the chunk (2048 chunk, 128 rows: 120 MiB and 98 MiB less)
+    const size_t hy_rows_max = kv_i8 && E.main_hybrid && E.use_mmq
+                                   ? (size_t) std::min(E.tmax, std::max(E.hybrid_t, Engine::kGemmT)) : (size_t) E.tmax;
+    if (hy_rows_max < (size_t) E.tmax) {
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(E.escr));
+        CK(cudaMalloc(&E.escr, K::native_expert_scratch_bytes((int64_t) (hy_rows_max * m.top_k), (int64_t) g.n_ff)));
+        CK(cudaMemGetInfo(&fr, &tot));
+        budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
+    }
+    const size_t ecpu_bytes = hy_rows_max * (size_t) m.top_k * (size_t) g.n_embd * 4;
+    // --kv int8: a staging pair that leaves no room beside it for the hybrid buffers and the 512 MiB the slots keep free,
+    // even with the scores buffer at 64 MB (a long context on a small card: 204800 cells on 8 GB): one staging buffer,
+    // as STRATA_Q36_SINGLE_STAGE=1 (a layer's copy then waits for the one before to finish computing)
+    if (kv_i8 && E.n_stage == 2 && E.use_mmq && E.main_hybrid) {
+        const size_t att_save = E.kAttScoreFloats > ((size_t) 16 << 20) ? (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6 : 0;
+        const size_t pair = 2 * (max_layer + kMmqTail) + ecpu_bytes + hy_rows_max * (size_t) m.top_k * 4 + ((size_t) 512 << 20);
+        if (pair > fr + att_save) {
+            E.n_stage = 1;
+            std::fprintf(stderr, "strata-q36: the prompt's staging pair (%.2f GiB) does not fit in the %.2f GiB free: one "
+                         "staging buffer (%.2f GiB), as STRATA_Q36_SINGLE_STAGE=1\n",
+                         (double) (2 * (max_layer + kMmqTail)) / (1 << 30), (double) fr / (1 << 30),
+                         (double) (max_layer + kMmqTail) / (1 << 30));
+        }
+    }
+    const size_t staging = E.use_mmq && E.main_hybrid ? (size_t) E.n_stage * (max_layer + kMmqTail) : 0;
+    // the streamed prompt path needs the staging buffer(s) plus E.ecpu (allocated below) to fit; where they only just
+    // do not, shrink the attention scores buffer (256 -> 64 MB, the prompt attention then runs in more, smaller
+    // slices) so the staging fits - the same trade the MTP-only path above makes.  (Opt-in only - --kv int8 or
+    // STRATA_Q36_SINGLE_STAGE=1 - so the default path places exactly as before.  --kv int8 asks for 256 MiB beside them
+    // for what the first prompt allocates on the way - cuBLAS's own workspace, MMQ's pool, local memory -; and a
+    // blocked context where 64 MB is still short takes 32 MB, 32+ query rows per slice of a block.)
+    if (staging > 0 && E.kAttScoreFloats > ((size_t) 16 << 20) && (kv_i8 || E.n_stage == 1)) {
+        const size_t need = staging + ecpu_bytes + (kv_i8 ? ((size_t) 256 << 20) : ((size_t) 64 << 20));
+        if (need > fr) {
+            E.shrink_att((size_t) 16 << 20);
+            CK(cudaMemGetInfo(&fr, &tot));
+            budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
+            std::fprintf(stderr, "strata-q36: the prompt staging (%.2f GiB) did not fit: the attention scores buffer at "
+                         "64 MB instead of 256 (more, smaller slices in a long prompt), %.2f GiB free now\n",
+                         (double) staging / (1 << 30), (double) fr / (1 << 30));
+        }
+    }
+    {
+        const size_t att_cells = (size_t) ((E.kv16_blk > 0 ? E.kv16_blk : E.ctx) + 7) / 8 * 8;
+        const size_t small = (size_t) 8 << 20;   // 32 MB
+        if (staging > 0 && kv_i8 && E.kAttScoreFloats > small && (size_t) g.n_head * att_cells * 32 <= small &&
+            staging + ecpu_bytes + ((size_t) 256 << 20) > fr) {
+            E.shrink_att(small);
+            CK(cudaMemGetInfo(&fr, &tot));
+            budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
+            std::fprintf(stderr, "strata-q36: the prompt staging (%.2f GiB) still short: the attention scores buffer at 32 MB "
+                         "(%d query rows per slice of a %zu-cell block), %.2f GiB free now\n", (double) staging / (1 << 30),
+                         (int) std::min<size_t>((size_t) E.tmax, small / ((size_t) g.n_head * att_cells)), att_cells,
+                         (double) fr / (1 << 30));
+        }
+    }
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+    // --kv int8 at a context above the FP16 K / V block (E.kv16_blk): the scores buffer at 64 MB when that holds more
+    // expert slots (the blocked prompt attention then runs 4x as many, 4x smaller query slices per block)
+    if (slots <= 0 && vram_gib < 0 && !mtp_only && kv_i8 && E.kv16_blk > 0 && E.kAttScoreFloats > ((size_t) 16 << 20) &&
+        S < (int) ne) {
+        auto slots_at = [&](size_t f) {
+            const size_t b2 = f > reserve ? f - reserve : 0;
+            size_t sb = b2 > staging ? b2 - staging : 0;
+            if (sb + staging + ((size_t) 256 << 20) > f) sb = f > staging + ((size_t) 512 << 20) ? f - staging - ((size_t) 512 << 20) : 0;
+            return (int) std::min<size_t>((size_t) ne, sb / per_slot);
+        };
+        const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;
+        if (slots_at(fr + att_save) > S) {
+            E.shrink_att((size_t) 16 << 20);
+            CK(cudaMemGetInfo(&fr, &tot));
+            budget2 = fr > reserve ? fr - reserve : 0;
+            const int was = S;
+            S = slots_at(fr);
+            std::fprintf(stderr, "strata-q36: the attention scores buffer at 64 MB instead of 256 for more expert slots (%d "
+                         "per layer instead of %d), %.2f GiB free now\n", S, was, (double) fr / (1 << 30));
+        }
+    }
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
@@ -3052,7 +3320,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
+        size_t need = staging + ecpu_bytes + Tn * Kn * 4;
+        (void) Nn;
         for (Layer* L : all) {
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
             else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
@@ -3126,13 +3395,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
-    CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
+    CK(cudaMalloc(&E.ecpu, ecpu_bytes));
     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
+    if (std::getenv("STRATA_Q36_PLACE_DEBUG")) {
+        size_t f2 = 0, t2 = 0;
+        CK(cudaMemGetInfo(&f2, &t2));
+        std::fprintf(stderr, "strata-q36: staging alloc: n_stage=%d, max_layer=%.2f GiB (+%zu B), want=%.2f GiB, free=%.2f GiB\n",
+                     E.n_stage, (double) max_layer / (1 << 30), kMmqTail, (double) staging / (1 << 30),
+                     (double) f2 / (1 << 30));
+    }
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < E.n_stage; ++b) {
             CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
             CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
@@ -3990,6 +4266,7 @@ int strata::qwen35::run(int argc, char** argv) {
     E.kv_k8 = kv_k8;
     E.kv_v8 = kv_v8;
     E.use_graph = graph;
+    E.packed_droppable = expert_slots <= 0 && expert_vram < 0 && std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr;
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -4016,9 +4293,14 @@ int strata::qwen35::run(int argc, char** argv) {
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
             const int ns = std::max(1, batch);
             double kv_one = 45056.0;
-            const double kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
-            if (kv_k8 || kv_v8)   // --kv: an int8 store takes 1 + 2 / kKVG bytes per value instead of 4
+            double kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
+            if (kv_k8 || kv_v8) {   // --kv: an int8 store takes 1 + 2 / kKVG bytes per value instead of 4
                 kv_one *= ((kv_k8 ? 1.03125 / 4.0 : 1.0) + (kv_v8 ? 1.03125 / 4.0 : 1.0)) / 2.0;
+                // the FP16 copies (none past a block: Engine::kv16_blk) and the split-K partials (kGemmT rows instead of 64)
+                const auto& g = m.g;
+                kv_shared = (Engine::kv16_block_cells(true, ctx) > 0 ? 0.0 : (double) (g.n_head_kv * g.head_dim * 2 * 2)) +
+                            (double) (g.n_head * Engine::kGemmT) * (double) (g.head_dim + 2) * 4.0 / kChunkCells;
+            }
             const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})
