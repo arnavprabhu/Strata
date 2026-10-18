@@ -3436,17 +3436,21 @@ struct Engine {
     // is read.  The next turn of the chat re-renders that history the same way but not the header and the answer (the
     // template drops the empty <think></think> of earlier answers), so it resumes there instead of reading from token 0.
     bool turn_ckpt = false;
-    void ckpt_copy(bool save) {
-        Sess& ss = sess[(size_t) cur];
+    /// The bytes of the current session's recurrent state: each GDN layer's conv and S, hlast.
+    size_t rec_bytes() const {
         const auto& g = m->g;
         const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4;
         const size_t sb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
-        if (!ss.ck_host) {
-            size_t bytes = (size_t) g.n_embd * 4;
-            for (float* c : conv) bytes += c ? cb + sb : 0;
-            CK(cudaHostAlloc(&ss.ck_host, bytes, cudaHostAllocDefault));
-        }
-        char* h = (char*) ss.ck_host;
+        size_t bytes = (size_t) g.n_embd * 4;
+        for (float* c : conv) bytes += c ? cb + sb : 0;
+        return bytes;
+    }
+    /// The current session's recurrent state to (save) or from host memory `h` (rec_bytes() bytes).
+    void rec_copy(void* host, bool save) {
+        const auto& g = m->g;
+        const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4;
+        const size_t sb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
+        char* h = (char*) host;
         auto cp = [&](void* d, size_t n) {
             CK(cudaMemcpyAsync(save ? (void*) h : d, save ? d : (void*) h, n,
                                save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, st));
@@ -3455,6 +3459,48 @@ struct Engine {
         for (size_t l = 0; l < conv.size(); ++l)
             if (conv[l]) { cp(conv[l], cb); cp(S[l], sb); }
         cp(hlast, (size_t) g.n_embd * 4);
+        CK(cudaStreamSynchronize(st));
+    }
+    /// The current session's checkpoint buffer (pinned, rec_bytes()), allocated on first use.
+    void* ck_buf() {
+        Sess& ss = sess[(size_t) cur];
+        if (!ss.ck_host) CK(cudaHostAlloc(&ss.ck_host, rec_bytes(), cudaHostAllocDefault));
+        return ss.ck_host;
+    }
+    void ckpt_copy(bool save) { rec_copy(ck_buf(), save); }
+
+    // STRATA_Q36_PARK_MIB=N (opt-in): conversations parked in host RAM (see Serve::park).  A parked image holds the
+    // first n cells of every K / V store (layer by layer: K, then V; an int8 store's codes, then its scales), packed
+    // with a host row pitch of `cap` cells, so a restore can bring back any n <= cap of them.
+    /// Host bytes of `cells` cells of all the K / V stores.
+    size_t kv_cells_bytes(int64_t cells) const {
+        const size_t HKV = (size_t) m->g.n_head_kv, HD = (size_t) m->g.head_dim, ng = HD / kKVG;
+        auto one = [&](bool i8) { return i8 ? HKV * (HD + ng * 2) : HKV * HD * 4; };
+        size_t per = 0;
+        for (float* k : kc) per += k ? one(kv_k8) + one(kv_v8) : 0;
+        return per * (size_t) cells;
+    }
+    /// The current session's cells [0, n) to (save) or from a parked image of `cap` cells at `host`.
+    void kv_copy(char* host, int64_t cap, int64_t n, bool save) {
+        if (n <= 0) return;
+        const int HKV = (int) m->g.n_head_kv, HD = (int) m->g.head_dim;
+        const size_t ng = (size_t) HD / kKVG;
+        char* h = host;
+        auto cp2 = [&](void* d, size_t dpitch, size_t hpitch, size_t width) {
+            if (save) CK(cudaMemcpy2DAsync(h, hpitch, d, dpitch, width, (size_t) HKV, cudaMemcpyDeviceToHost, st));
+            else CK(cudaMemcpy2DAsync(d, dpitch, h, hpitch, width, (size_t) HKV, cudaMemcpyHostToDevice, st));
+            h += hpitch * (size_t) HKV;
+        };
+        auto store = [&](float* d, bool i8) {
+            if (!i8) {
+                cp2(d, (size_t) ctx * HD * 4, (size_t) cap * HD * 4, (size_t) n * HD * 4);
+                return;
+            }
+            cp2(d, (size_t) ctx * HD, (size_t) cap * HD, (size_t) n * HD);
+            cp2(kv8_scales(d, HKV, ctx, HD), (size_t) ctx * ng * 2, (size_t) cap * ng * 2, (size_t) n * ng * 2);
+        };
+        for (size_t l = 0; l < kc.size(); ++l)
+            if (kc[l]) { store(kc[l], kv_k8); store(vc[l], kv_v8); }
         CK(cudaStreamSynchronize(st));
     }
     /// The current session's state after its first n cells becomes its checkpoint.
@@ -4091,8 +4137,183 @@ struct Serve {
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
 
+    // STRATA_Q36_PARK_MIB=N (opt-in, default 0 = off): the engine holds one conversation, so a client that puts short
+    // side requests (a title, a topic check) between the turns of an agent's chat had the chat read again from token 0
+    // after each of them.  With a budget, the conversation a request is about to overwrite is parked in host RAM (its
+    // K / V cells, its recurrent state at the end and at its turn checkpoint), and a later prompt that starts with a
+    // parked conversation's tokens brings it back instead of reading them.  A prompt read from the start also parks the
+    // state at the end of its first message (the system prompt and tools, when that is at least
+    // STRATA_Q36_PARK_ROOT tokens, default 2048) as a shared root: a new chat of the same client borrows it.
+    //   STRATA_Q36_PARK_SLOTS (default 4): at most that many parked entries (oldest use leaves first, roots last)
+    //   STRATA_Q36_PARK_MIN (default 1024): conversations shorter than this are not parked
+    //   STRATA_Q36_PARK_FREE_MIB (default 1024): RAM (MemAvailable) that must be left after a park
+    struct Parked {
+        std::vector<int32_t> live;            // its tokens; the K / V image holds cells [0, cap)
+        int64_t cap = 0;
+        std::vector<char> kv;
+        struct State { int64_t n; std::vector<char> rec; };
+        std::vector<State> states;            // the recurrent state after live[0, n), n <= cap
+        bool root = false;                    // a shared prefix: a match borrows it (it stays parked)
+        uint64_t used = 0;
+        size_t bytes() const {
+            size_t b = kv.size();
+            for (const State& s : states) b += s.rec.size();
+            return b;
+        }
+    };
+    std::vector<Parked> parked;
+    size_t park_budget = 0, park_free = (size_t) 1024 << 20;
+    int park_slots = 4;
+    int64_t park_min = 1024, park_root = 2048;
+    uint64_t park_clock = 0;
+
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_Q36_PARK_MIB")) park_budget = (size_t) std::max(0L, std::atol(v)) << 20;
+        if (const char* v = std::getenv("STRATA_Q36_PARK_SLOTS")) park_slots = std::max(1, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_Q36_PARK_MIN")) park_min = std::max(1L, std::atol(v));
+        if (const char* v = std::getenv("STRATA_Q36_PARK_ROOT")) park_root = std::max(0L, std::atol(v));
+        if (const char* v = std::getenv("STRATA_Q36_PARK_FREE_MIB")) park_free = (size_t) std::max(0L, std::atol(v)) << 20;
+        if (park_budget > 0)
+            std::fprintf(stderr, "strata serve: STRATA_Q36_PARK_MIB=%zu: up to %d conversations parked in host RAM "
+                         "(min %lld tokens, system-prompt root from %lld tokens, %zu MiB left free)\n", park_budget >> 20,
+                         park_slots, (long long) park_min, (long long) park_root, park_free >> 20);
+    }
+
+    /// MemAvailable from /proc/meminfo (bytes; SIZE_MAX when it cannot be read: no check).
+    static size_t mem_available() {
+        FILE* f = std::fopen("/proc/meminfo", "r");
+        if (!f) return SIZE_MAX;
+        char line[256];
+        size_t kb = SIZE_MAX;
+        while (std::fgets(line, sizeof line, f))
+            if (std::sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
+        std::fclose(f);
+        return kb == SIZE_MAX ? kb : kb << 10;
+    }
+    size_t parked_bytes() const {
+        size_t b = 0;
+        for (const Parked& p : parked) b += p.bytes();
+        return b;
+    }
+    /// The longest state of a parked entry whose tokens start `ids` (a proper start): its index and length, else -1 / 0.
+    std::pair<int, int64_t> park_match(const std::vector<int32_t>& ids) const {
+        int best = -1;
+        int64_t bn = 0;
+        for (size_t i = 0; i < parked.size(); ++i) {
+            const Parked& p = parked[i];
+            for (const Parked::State& s : p.states) {
+                if (s.n <= bn || s.n >= (int64_t) ids.size()) continue;
+                if (std::equal(p.live.begin(), p.live.begin() + s.n, ids.begin())) { bn = s.n; best = (int) i; }
+            }
+        }
+        return {best, bn};
+    }
+    /// Room for `need` more bytes and one more entry: the least recently used leave (conversations before roots).
+    bool park_room(size_t need) {
+        if (need > park_budget) return false;
+        while (!parked.empty() && ((int) parked.size() >= park_slots || parked_bytes() + need > park_budget)) {
+            size_t v = 0;
+            for (size_t i = 1; i < parked.size(); ++i) {
+                const Parked &a = parked[i], &b = parked[v];
+                if (a.root != b.root ? !a.root : a.used < b.used) v = i;
+            }
+            std::fprintf(stderr, "strata serve: park: evicted a %s of %zu tokens (%.0f MiB)\n",
+                         parked[v].root ? "root" : "conversation", parked[v].live.size(), parked[v].bytes() / 1048576.0);
+            parked.erase(parked.begin() + (long) v);
+        }
+        const size_t avail = mem_available();
+        return avail == SIZE_MAX || avail >= need + park_free;
+    }
+    /// Parks the current session's state after toks[0, n) (its K / V cells and the device's recurrent state), and the
+    /// checkpoint (ck_n, ck_rec) when ck_n is in (0, n).  n_end 0: the device state is not at n (only the checkpoint).
+    void park_now(const int32_t* toks, int64_t n, bool at_end, int64_t ck_n, const void* ck_rec, bool root) {
+        if (n <= 0 || (!at_end && ck_n <= 0)) return;
+        const int64_t cap = at_end ? n : ck_n;
+        // already parked (the same tokens up to the same state) or superseded copies of this conversation
+        for (size_t i = 0; i < parked.size();) {
+            Parked& p = parked[i];
+            const int64_t m = std::min<int64_t>((int64_t) p.live.size(), cap);
+            const bool prefix = std::equal(p.live.begin(), p.live.begin() + m, toks);
+            if (prefix && (int64_t) p.live.size() >= cap && (p.root == root || p.root)) {
+                bool has = false;
+                for (const Parked::State& s : p.states) has |= s.n == cap;
+                if (has) { p.used = ++park_clock; return; }
+            }
+            if (prefix && !p.root && !root && (int64_t) p.live.size() <= cap) parked.erase(parked.begin() + (long) i);
+            else ++i;
+        }
+        const size_t rb = E.rec_bytes();
+        const bool with_ck = at_end && ck_n > 0 && ck_n < n && ck_rec;
+        const size_t need = E.kv_cells_bytes(cap) + (at_end ? rb : 0) + (with_ck || !at_end ? rb : 0);
+        if (!park_room(need)) {
+            std::fprintf(stderr, "strata serve: park: skipped a %s of %lld tokens (%.0f MiB: over the budget or the RAM "
+                         "floor)\n", root ? "root" : "conversation", (long long) cap, need / 1048576.0);
+            return;
+        }
+        const auto t0 = Clock::now();
+        Parked p;
+        try {
+            p.live.assign(toks, toks + cap);
+            p.kv.resize(E.kv_cells_bytes(cap));
+            if (at_end) p.states.push_back({n, std::vector<char>(rb)});
+            if (with_ck || !at_end) {
+                p.states.push_back({ck_n, std::vector<char>(rb)});
+                std::memcpy(p.states.back().rec.data(), ck_rec, rb);
+            }
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr, "strata serve: park: no memory for %.0f MiB\n", need / 1048576.0);
+            return;
+        }
+        p.cap = cap;
+        p.root = root;
+        p.used = ++park_clock;
+        E.kv_copy(p.kv.data(), cap, cap, true);
+        if (at_end) E.rec_copy(p.states.front().rec.data(), true);
+        std::fprintf(stderr, "strata serve: park: parked a %s of %lld tokens (%.0f MiB in %.0f ms; %zu parked, %.0f MiB)\n",
+                     root ? "root" : "conversation", (long long) cap, need / 1048576.0, ms_since(t0), parked.size() + 1,
+                     (parked_bytes() + need) / 1048576.0);
+        parked.push_back(std::move(p));
+    }
+    /// The current session (about to be overwritten) to the park, when it is worth a place.
+    void park_session(Engine::Sess& ss) {
+        if (park_budget == 0 || ss.active || !ss.imgs.empty() || ss.rdelta != 0) return;
+        const int64_t L = (int64_t) ss.live.size();
+        if (L < park_min) return;
+        const bool at_end = E.pos == L;
+        const bool ck_ok = E.turn_ckpt && ss.ck_n > 0 && ss.ck_n <= L && ss.ck_host;
+        if (!at_end && !ck_ok) return;
+        park_now(ss.live.data(), at_end ? L : ss.ck_n, at_end, ck_ok ? ss.ck_n : 0, ck_ok ? ss.ck_host : nullptr, false);
+    }
+    /// Parked entry i's state of length n into the current session (a conversation leaves the park; a root stays).
+    void park_restore(int i, int64_t n) {
+        const auto t0 = Clock::now();
+        Parked& p = parked[(size_t) i];
+        Engine::Sess& ss = E.sess[(size_t) E.cur];
+        const Parked::State* st = nullptr;
+        const Parked::State* ck = nullptr;
+        for (const Parked::State& s : p.states) {
+            if (s.n == n) st = &s;
+            else if (s.n < n && (!ck || s.n > ck->n)) ck = &s;
+        }
+        E.kv_copy(p.kv.data(), p.cap, n, false);
+        E.rec_copy(const_cast<char*>(st->rec.data()), false);
+        E.pos = n;
+        ss.pos = n;
+        E.set_delta(0);
+        ss.live.assign(p.live.begin(), p.live.begin() + n);
+        ss.imgs.clear();
+        ss.ck_n = 0;
+        if (ck && E.turn_ckpt) {   // the conversation's turn checkpoint comes back with it
+            std::memcpy(E.ck_buf(), ck->rec.data(), ck->rec.size());
+            ss.ck_n = ck->n;
+            ss.ck_rdelta = 0;
+        }
+        std::fprintf(stderr, "strata serve: park: %s a %s at %lld of its %zu tokens in %.0f ms\n",
+                     p.root ? "borrowed" : "restored", p.root ? "root" : "conversation", (long long) n, p.live.size(),
+                     ms_since(t0));
+        if (p.root) p.used = ++park_clock;
+        else parked.erase(parked.begin() + i);
     }
 
     /// BSTOP / BYIELD lines among the queued ones: applied now (a window is a moment away at most).
@@ -4445,6 +4666,21 @@ struct Serve {
             }
         }
         E.select(s);
+        if (!adm && park_budget > 0 && ir.imgs.empty()) {   // STRATA_Q36_PARK_MIB: a parked conversation that holds more
+            const size_t have = std::max(reuse, ck_len(ss, ids, ir.imgs));
+            auto [pi, pn] = park_match(ids);
+            if (pi >= 0 && (size_t) pn > have) {
+                parked[(size_t) pi].used = ++park_clock;   // (the park below leaves it be)
+                park_session(ss);
+                std::tie(pi, pn) = park_match(ids);
+                if (pi >= 0 && (size_t) pn > have) {
+                    park_restore(pi, pn);
+                    reuse = match_len(ss, ids, ir.imgs);
+                }
+            } else if (have == 0) {
+                park_session(ss);   // this prompt reads from the start over it
+            }
+        }
         if (!adm && reuse == 0) {   // STRATA_Q36_TURN_CKPT: the held answer is not this prompt's, its turn boundary is
             const size_t c = ck_len(ss, ids, ir.imgs);
             if (c > 0) {
@@ -4485,15 +4721,47 @@ struct Serve {
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
         };
+        // STRATA_Q36_PARK_MIB: a prompt whose first message (the system prompt and tools) ends at or after
+        // STRATA_Q36_PARK_ROOT tokens and is not parked yet is read in two parts there, and the state between them is
+        // parked as a shared root
+        int64_t root = 0;
+        if (park_budget > 0 && park_root > 0 && !adm && ir.imgs.empty()) {
+            int64_t r = 0;
+            for (size_t i = 1; i < ids.size(); ++i)
+                if (ids[i] == kImStart) { r = (int64_t) i; break; }
+            root = r - (int64_t) reuse;
+            if (r < park_root || root < 2 || fresh - root < 2 || (split > 0 && split - root < 2 && split != root))
+                root = 0;
+            if (root > 0 && split == root) root = 0;   // the turn checkpoint is the same point: no second part
+            for (const Parked& p : parked) {
+                if (root == 0) break;
+                if (!p.root || (int64_t) p.live.size() != r) continue;
+                if (std::equal(p.live.begin(), p.live.end(), ids.begin())) root = 0;
+            }
+        }
         int64_t got;
-        if (split == 0) {
+        if (split == 0 && root == 0) {
             got = E.process(ids.data() + reuse, fresh, on_read);
-        } else {
-            got = E.process(ids.data() + reuse, split, on_read, false);
-            if (got == split && !cancelled) {
-                E.ckpt_save((int64_t) reuse + split);
-                got += E.process(ids.data() + reuse + split, fresh - split,
-                                 [&](int64_t done) -> bool { return on_read(split + done); });
+        } else if (split == 0 || root == 0 || root > split) {   // one cut (or the root after the turn split: only that)
+            const int64_t cut = split > 0 ? split : root;
+            got = E.process(ids.data() + reuse, cut, on_read, false);
+            if (got == cut && !cancelled) {
+                if (split > 0) E.ckpt_save((int64_t) reuse + split);
+                else park_now(ids.data(), (int64_t) reuse + root, true, 0, nullptr, true);
+                got += E.process(ids.data() + reuse + cut, fresh - cut,
+                                 [&](int64_t done) -> bool { return on_read(cut + done); });
+            }
+        } else {   // the root, then the turn checkpoint, then the rest
+            got = E.process(ids.data() + reuse, root, on_read, false);
+            if (got == root && !cancelled) {
+                park_now(ids.data(), (int64_t) reuse + root, true, 0, nullptr, true);
+                got += E.process(ids.data() + reuse + root, split - root,
+                                 [&](int64_t done) -> bool { return on_read(root + done); }, false);
+                if (got == split && !cancelled) {
+                    E.ckpt_save((int64_t) reuse + split);
+                    got += E.process(ids.data() + reuse + split, fresh - split,
+                                     [&](int64_t done) -> bool { return on_read(split + done); });
+                }
             }
         }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);

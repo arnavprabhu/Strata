@@ -130,6 +130,7 @@ strata-q36: hybrid experts: 0 of 256 per layer in VRAM (0.00 GiB), all 18.75 GiB
 | `STRATA_Q36_KEEP_PACKED=1` | unset | Keeps the packed Q8_0 decode copies (existing switch). |
 | `STRATA_Q36_PENALTY_SPEC=1` | off | A temperature-0 request that has a penalty (the model card fills in `presence_penalty` 1.5) took no MTP drafts (`drafts accepted 0 of 0`). With this set it takes them: each verify row is picked on the host from that row's penalized logits, and the window stops at the first draft that does not match. |
 | `STRATA_Q36_TURN_CKPT=1` | off | The Qwen3.6 chat template renders an earlier answer differently once the next turn exists (it drops the empty `<think></think>`), so the held state was never the start of the next prompt and every agent turn read the whole chat again. With this set, a prompt is read up to its last `<|im_start|>`, the recurrent state there (GDN conv and state, about 63 MiB by the code, not logged) is copied to pinned host memory, then the rest is read; the next turn resumes from that copy. |
+| `STRATA_Q36_PARK_MIB=N` | 0 (off) | The engine holds one conversation, so a short side request between two turns of an agent's chat (Claude Code's title and topic calls, about 340 tokens) replaced it and the next turn read the whole chat again. With a budget the conversation a request is about to overwrite is parked in host RAM (its K / V cells, its recurrent state at the end and at its turn checkpoint; 338 MiB at 19,135 tokens, logged), and a prompt that starts with a parked conversation's tokens brings it back (31-37 ms at 19K, logged) instead of reading them. A prompt read from the start is also cut at the end of its first message (the system prompt and tools) when that is `STRATA_Q36_PARK_ROOT` tokens or more (default 2048), and the state there is parked as a shared root, so a new chat with the same system prompt (a subagent, a new session) reads only what follows it. `STRATA_Q36_PARK_SLOTS` (default 4) entries at most, oldest use leaving first and roots last; `STRATA_Q36_PARK_MIN` (default 1024) is the shortest conversation parked; `STRATA_Q36_PARK_FREE_MIB` (default 1024) is the RAM (MemAvailable) a park must leave. A batch slot's request (`BGEN`) neither parks nor restores; nor does a prompt with pictures. |
 | `STRATA_Q36_ATTN_GQA=1` | off | Decode attention with one block per (token, KV head, chunk of cells) for the 8 query heads that share a KV head: each K / V cell is read once per KV head instead of once per query head. int8 stores on sm_80 and newer: Q.K and P.V on FP16 tensor cores (FP32 sums); FP32 stores, and int8 before sm_80: CUDA cores. Unset: the old kernels and launches. |
 | `STRATA_Q36_ATTN_GQA_CHUNK=cells` | 1024 | The chunk of cells per block for the GQA kernel (a multiple of its 256-cell tile). |
 
@@ -207,6 +208,16 @@ Why each step:
    prompt (256 tokens, 1 run each): 10.5 tok/s with VD + `TURN_CKPT` and requests at `presence_penalty` 0 (drafts
    on), 37.8 with the final configuration (model card penalty 1.5, `PENALTY_SPEC`, `ATTN_GQA`); after 29,508 / 29,509 tokens:
    38.4 -> 41.9. The sampling differs between these two runs, so they change more than the kernel. Details below.
+8. **Parked conversations** (`STRATA_Q36_PARK_MIB=3072`, on top of the final configuration, 1 run each). An agent-like
+   sequence: a 19,099-token chat (a system prompt of 19,075 tokens) for 5 turns with a 46-token side request after each, then
+   a second chat with the same system prompt for 2 turns, then the first chat's last turn (13 requests, 48-token greedy
+   answers). Without parking 12.4% of the prompt tokens were reused and the prompts took 147.4 s (every main turn read
+   ~19.2K tokens in 20.5 s). With it 87.2% and 29.8 s: each main turn read 47-78 tokens in 0.7-1.2 s, the second chat
+   read 22 tokens after the borrowed root, and each park took 173-256 ms. Same tokens: a 3K-token chat for 4 turns (96-token
+   greedy answers, `STRATA_Q36_PARK_MIN=500 STRATA_Q36_PARK_ROOT=1000`) with a side request after each turn (every turn
+   restored from the park) gave the same text, byte for byte, as the same chat without side requests (every turn
+   continued in the live session): 4 of 4. Against reading the chat in full (parking off) the texts differ after a few
+   words, as they do for the turn checkpoint: the read is cut at other points.
 
 ## The GQA decode attention kernel
 
@@ -295,6 +306,10 @@ strata --pack coder-iq1_m --native Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-000
 - **Same tokens.** Not checked token for token: that a penalized greedy request gives the same text with and without
   `STRATA_Q36_PENALTY_SPEC`, and that a turn resumed from `STRATA_Q36_TURN_CKPT` gives the same tokens as reading the
   whole chat again. Both are designed to give the same text, but that was not measured.
+- **Parking** (`STRATA_Q36_PARK_MIB`). Measured with the scripted sequence above, not a real Claude Code session; not
+  with `--batch` (a batch slot's request neither parks nor restores) or pictures; no conversation above 19.4K tokens was parked (the image grows
+  about 11.6 KB per token by the code: about 1.7 GiB at 150K). The extra cut at the system prompt's end (only when
+  that root is not parked yet) was not timed apart.
 - **Speed runs.** The step-by-step screens are 1 run each. Only the final suite has 3 runs; the end-to-end GQA test
   has 2.
 - **Upstream.** #2917, #2698 and #2742 are open pull requests, not merged upstream. Their merges here were resolved by
