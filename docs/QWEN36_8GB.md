@@ -43,19 +43,19 @@ off, temperature 0, the model card's sampling (the server fills in `presence_pen
 | short chat (9 requests) | 43-51 | - | 45.2 (41.8-52.8) | 0.58 (0.55-0.64) |
 | 4K prompt, fresh | 4,019 | 953.9 (951.4-960.4) | - | 4.22 (4.20-4.23) |
 | 16K prompt, fresh | 16,058 | 967.4 (962.7-970.7) | - | 16.62 (16.56-16.71) |
-| agent session, follow-up turns | up to 14,532 | - | 45.7 (39.8-49.2) | 4.13 (2.12-4.70) |
+| agent session, follow-up turns | 14,532 (14,523-14,550) at the last turn | - | 45.7 (39.8-49.2) | 4.13 (2.12-4.70) |
 
 Agent session: 68.2% (68.1-68.2) of the follow-up turns' prompt tokens came from the conversation cache; 261
 (252-279) earlier-turn tokens were read again per session (30,177 without the turn checkpoint, see below).
 
-**Long prompts**, same configuration, **1 run each** (2026-10-18; prompt and decode speeds from the engine's log,
-first token from the client):
+**Long prompts**, same configuration, **1 run each** unless noted (2026-10-18; prompt and decode speeds from the
+engine's log, first token from the client):
 
 | Prompt | Prompt tokens | Read in | Prompt tok/s | Generated | Decode tok/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | code files, 32K (`strata-bench.py`, below) | 29,509 | 31.9 s (first token 32.7 s) | 923.9 | 256 | 41.9 |
 | needle, 64K (3 depths) | 66,168-66,169 | 84.1 s | 787.2 | 9-10 | (too few tokens) |
-| this engine's source file, thinking on (GQA test below) | 110,094 | 169.2 s | 650.5 | 128 | 42.8 |
+| this engine's source file, thinking on (GQA test below; its run on the final build) | 110,094 | 169.3 s | 650.4 | 128 | 42.9 |
 | code files, 128K (`strata-bench.py`, below) | 147,910 | 263.7 s (first token 264.0 s) | 561.0 | 256 | 37.8 |
 | needle, 190K (3 depths) | 190,462-190,464 | 389.0 s | 489.7 | 9-10 | (too few tokens) |
 
@@ -75,11 +75,11 @@ hand (the flags setup uses for CUDA; `89` is the RTX 40 series, use your card's)
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
   -DSTRATA_GGML_DIR=<strata>/third_party/llama.cpp
-cmake --build build --target strata strata_kq
+cmake --build build --target strata
 ```
 
-`strata_kq` is `build/libstrata_kq.so`, the K-quant prompt kernels (the `strata` target alone does not build it); keep
-it next to the `strata` binary, where the engine looks for it. Get the model and its tokenizer
+With `-DSTRATA_MMQ_KQUANTS=ON` on CUDA the `strata` target also builds `build/libstrata_kq.so` (the K-quant prompt
+kernels) as a dependency; keep it next to the `strata` binary, where the engine looks for it. Get the model and its tokenizer
 with setup (`--family qwen36 --model UD-Q4_K_XL`, [QWEN36.md](QWEN36.md)).
 
 **The config** used for every final number (`serve/server.py --engine strata --config <this file>`; paths are
@@ -101,8 +101,9 @@ placeholders):
 ```
 
 - `--kv int8`: int8 K / V caches (#2698). This flag also turns on this branch's VRAM savings (below).
-- `--prefill 2048`: the prompt chunk. At 204,800 cells the automatic choice is 512; 2048 reads prompts 3.7 times
-  as fast on this card (see VC and VD below).
+- `--prefill 2048`: the prompt chunk. At 204,800 cells the automatic choice was 512 on the VC build (the final build
+  was not started with `--prefill auto` at 204,800); 2048 reads prompts 3.7 times as fast on this card (see VC and VD
+  below).
 - `--pool-workers 10`: the CPU pool's threads (the engine logs 11 with the main thread).
 - `--mtp 2`: the MTP drafts, as setup writes it.
 
@@ -123,12 +124,12 @@ strata-q36: hybrid experts: 0 of 256 per layer in VRAM (0.00 GiB), all 18.75 GiB
 
 | Switch | Default | What it does |
 | --- | --- | --- |
-| `--kv int8` (also `k8v8`, `k8v32`, `k32v8`; #2698) | `fp32` | int8 K / V stores. With an int8 store this branch also: gives the packed Q8_0 decode copies back **before** the sessions when the sessions would not fit (3ee94325; with FP32 stores the old order and its failure are kept), sizes the CPU pool's outputs and the grouped experts' scratch for the hybrid batch instead of the chunk (120 + 98 MiB less at chunk 2048), puts the MMQ gate+up and SwiGLU buffers in the experts' output rows (96 MiB less), sizes the split-K partials by their bound (32.1 -> 8.0 MiB), and uses one staging buffer and a smaller attention scores buffer when the pair does not fit. |
+| `--kv int8` (also `k8v8`, `k8v32`, `k32v8`; #2698) | `fp32` | int8 K / V stores. With an int8 store this branch also: gives the packed Q8_0 decode copies back **before** the sessions when the sessions would not fit (3ee94325; with FP32 stores the old order and its failure are kept), sizes the CPU pool's outputs and the grouped experts' scratch for the hybrid batch instead of the chunk (120 + 98 MiB less at chunk 2048), puts the MMQ gate+up and SwiGLU buffers in the experts' output rows (96 MiB less), sizes the split-K partials by their bound (32.1 -> 8.0 MiB) (these MiB from the code's arithmetic, not measured; logged at chunk 2048, VC -> VD: sessions 2.34 -> 2.27 GiB, 0.34 -> 0.54 GiB free after the MTP block), and uses one staging buffer and a smaller attention scores buffer when the pair does not fit. |
 | `STRATA_Q36_KV16_BLOCK=cells` | 16384 under an int8 store at a context above 16,384 cells; 0 (off) otherwise | Prompt attention over the context in blocks of this many cells, with an online softmax, so its FP16 copy of K / V is one block (0.031 GiB) instead of the whole context (0.391 GiB at 204,800). `0` turns it off. |
 | `STRATA_Q36_SINGLE_STAGE=1` (#2742) | off; automatic under an int8 store when the staging pair does not fit | One prompt staging buffer instead of two: a layer's copy waits for the previous layer to finish. |
 | `STRATA_Q36_KEEP_PACKED=1` | unset | Keeps the packed Q8_0 decode copies (existing switch). |
 | `STRATA_Q36_PENALTY_SPEC=1` | off | A temperature-0 request that has a penalty (the model card fills in `presence_penalty` 1.5) took no MTP drafts (`drafts accepted 0 of 0`). With this set it takes them: each verify row is picked on the host from that row's penalized logits, and the window stops at the first draft that does not match. |
-| `STRATA_Q36_TURN_CKPT=1` | off | The Qwen3.6 chat template renders an earlier answer differently once the next turn exists (it drops the empty `<think></think>`), so the held state was never the start of the next prompt and every agent turn read the whole chat again. With this set, a prompt is read up to its last `<|im_start|>`, the recurrent state there (GDN conv and state, ~63 MiB) is copied to pinned host memory, then the rest is read; the next turn resumes from that copy. |
+| `STRATA_Q36_TURN_CKPT=1` | off | The Qwen3.6 chat template renders an earlier answer differently once the next turn exists (it drops the empty `<think></think>`), so the held state was never the start of the next prompt and every agent turn read the whole chat again. With this set, a prompt is read up to its last `<|im_start|>`, the recurrent state there (GDN conv and state, about 63 MiB by the code, not logged) is copied to pinned host memory, then the rest is read; the next turn resumes from that copy. |
 | `STRATA_Q36_ATTN_GQA=1` | off | Decode attention with one block per (token, KV head, chunk of cells) for the 8 query heads that share a KV head: each K / V cell is read once per KV head instead of once per query head. int8 stores on sm_80 and newer: Q.K and P.V on FP16 tensor cores (FP32 sums); FP32 stores, and int8 before sm_80: CUDA cores. Unset: the old kernels and launches. |
 | `STRATA_Q36_ATTN_GQA_CHUNK=cells` | 1024 | The chunk of cells per block for the GQA kernel (a multiple of its 256-cell tile). |
 
@@ -175,10 +176,11 @@ Blank: not tried.
 
 Why each step:
 
-1. **#2917.** Main stops at 16K: the hybrid mode's buffers and staging do not fit beside the weights and the FP32
+1. **#2917.** Main fails at 16K (8K is the largest that starts): the hybrid mode's buffers and staging do not fit beside the weights and the FP32
    caches. #2917 gives the packed Q8_0 copies (1.78 GiB) back for the staging; 32K starts, 64K does not.
-2. **`--kv int8`.** The FP32 caches take 2 KB per cell per store. Two int8 pull requests were tried. #2698 (VA) and
-   #2742 (VB) both start at 64K, but at the agent session's last turn (14.5K tokens in the cache) VA decodes at 42.5
+2. **`--kv int8`.** The FP32 caches take 2 KiB per cell per store in each of the 10 attention layers (20 KiB per
+   cell per store). Two int8 pull requests were tried. #2698 (VA) and #2742 (VB) both start at 64K, but at the agent
+   session's last turn (14.5K tokens in the K / V cache, the whole chat read again) VA decodes at 42.5
    tok/s and VB at 24.0. The branch keeps #2698's layout and decode kernels, and only #2742's single staging buffer.
 3. **Past 64K** (VC). At 128K and 200K the sessions' caches no longer fit before the hybrid buffers. The packed
    copies are now given back before the sessions are allocated, and the prompt attention's FP16 K / V is blocked.
@@ -194,13 +196,17 @@ Why each step:
    the short chat decoded at 43.2 tok/s. Sending `presence_penalty` 0 instead gave 47.2 with drafts. With the switch
    and the model card's penalty: 45.1 (1 run) and 45.2 (final, 3 runs, range 41.8-52.8), with drafts accepted (for
    example 62 of 74).
-6. **Turn checkpoint** (`STRATA_Q36_TURN_CKPT`). Without it the cache hit over the follow-up turns was 0.0% and
-   30,177 earlier-turn tokens were read again per session. With it: 68.2%, 277 tokens, and the follow-up turns' first
-   token went from 10.13 s to 4.18 s. Fresh prompts read about 2% slower in these single runs (4K: 982.7 -> 958.2
-   tok/s), because the read is split in two at the turn boundary.
+6. **Turn checkpoint** (`STRATA_Q36_TURN_CKPT`; both rows with requests at `presence_penalty` 0). Without it the
+   cache hit over the follow-up turns was 0.0% and 30,177 earlier-turn tokens were read again per session. With it:
+   68.2%, 277 tokens, and the follow-up turns' first token went from 10.11 s to 4.18 s. Fresh prompts read about 2%
+   slower in these single runs (4K: 982.1 -> 958.2 tok/s); probably because the read is split in two at the turn
+   boundary, but that cause was not measured, and the only spread available is the final suite's 3 runs (951-960).
 7. **GQA decode attention** (`STRATA_Q36_ATTN_GQA`). At 150,000 cells the old decode attention took 6.0 ms per
-   attention layer for one int8 row, 60 ms over the 10 layers (microbenchmark below). Decode after a 147,915-token prompt (256 tokens, 1 run each): 10.5 tok/s in VD, 37.8
-   with the GQA kernel; after 29,508 tokens: 38.4 -> 41.9. Details below.
+   attention layer for one int8 row, 60 ms over the 10 layers (microbenchmark below). The like-for-like measurement
+   is the end-to-end on / off test below: 13.6 -> 42.9 tok/s after 110,094 tokens. Decode after a 147,915-token
+   prompt (256 tokens, 1 run each): 10.5 tok/s with VD + `TURN_CKPT` and requests at `presence_penalty` 0 (drafts
+   on), 37.8 with the final configuration (model card penalty 1.5, `PENALTY_SPEC`, `ATTN_GQA`); after 29,508 / 29,509 tokens:
+   38.4 -> 41.9. The sampling differs between these two runs, so they change more than the kernel. Details below.
 
 ## The GQA decode attention kernel
 
@@ -231,12 +237,13 @@ and 1.25e-6 (fp32). A row's output is bitwise the same alone or in a 3-row windo
 grid (30 of 30 cases). The compute_75 build passes the same checks.
 
 **End to end** (final configuration with and without `STRATA_Q36_ATTN_GQA=1`, a 110,094-token prompt (the engine's
-source file as one user message), 128 greedy tokens, thinking on, **2 runs each**, 2026-10-18):
+source file as one user message), 128 greedy tokens, thinking on, **2 runs each**, 2026-10-17/18; the first run of
+each side, on 2026-10-17, was on the build just before the final one, the second on the final build):
 
 | | without | with |
 | --- | ---: | ---: |
 | decode after 110,094 tokens | 13.6 / 13.6 tok/s | 42.8 / 42.9 tok/s |
-| prompt read | 169.4 s | 169.2 s |
+| prompt read | 169.45 / 169.47 s | 169.24 / 169.26 s |
 | decode, 23-token prompt, 40 tokens | 52.0 / 52.9 tok/s | 56.3 / 56.5 tok/s |
 
 The text is **not** the same with and without: the two 128-token answers agree for the first 107 characters, then
@@ -247,8 +254,8 @@ are the parity harness above and the six needles.
 ## Compared with Qwen3.8-Flash-Next Coder IQ1_M on the same laptop
 
 The upstream engine (0.1.45, commit 477ac13c) with this laptop's tuned config for the Coder IQ1_M (`--kv q4_0`,
-`--kv-resident 20480`, `--mmap-experts`, `--spec 4 --mtp rt` and other flags; full line in the Coder report), also at
-204,800 context. Suite: 3 runs, 2026-10-17. Long prompts and needles: 1 run. These are **different models** at very
+`--kv-resident 20480`, `--mmap-experts`, `--spec 4 --mtp rt` and other flags, full line below), also at 204,800
+context. Suite: 3 runs, 2026-10-17. Long prompts and needles: 1 run. These are **different models** at very
 different bit widths. The table compares speed only, not answer quality.
 
 | | Qwen3.6-35B-A3B UD-Q4_K_XL (this branch) | Flash-Next Coder IQ1_M (upstream) |
@@ -261,7 +268,19 @@ different bit widths. The table compares speed only, not answer quality.
 | 29.5K prompt: first token / decode (client) | 32.7 s / 41.8 tok/s | 80.0 / 28.9 |
 | 148K prompt: first token / decode (client) | 264.0 s / 37.7 tok/s | 258.5 / 28.6 (stopped after 72 tokens) |
 | needles found | 6 of 6 (64K and 190K, depths 10/50/90) | 2 of 2 (64K and 190K, depth 50) |
-| 64K / 190K needle request | 84.4 s / 389.4 s | 131.0 / 309.2 |
+| 64K / 190K needle request | 84.4 s / 389.4 s | 131.0 / 309.2 (190K: 16,384 tokens reused from the cache) |
+| prompt read, engine log: 148K / 190K | 561.0 / 489.7 tok/s | 574.8 / 565.2 (190K: over the 174,079 tokens read) |
+
+The Coder's 190K needle request reused 16,384 cached tokens (`190463 tokens = 16384 reused + 174079 read`), so it was
+not a fresh read like Qwen's. From about 148K up the Coder reads prompts faster, and its first token at 148K came
+earlier (258.5 s against 264.0). Qwen is faster on the 4K-64K prompts, in decode, and on the first token of short
+prompts.
+
+The Coder's command line (from its benchmark report, 2026-10-17, file paths shortened to names):
+
+```text
+strata --pack coder-iq1_m --native Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf --ple-gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf --expert-profile expert-profile-coder.bin --expert-cache auto --prefill auto --spec 4 --mtp rt --max-context 204800 --kv-resident 20480 --kv q4_0 --mmap-experts --spec-min-p 0.5 --adapt-every 1 --adapt-swaps 80 --adapt-decay 0.97 --mtp-draft-vocab draft_vocab_en.bin --vram-reserve-mib 1150 --prefill-head-alias --short-read 0
+```
 
 ## Not tested
 
