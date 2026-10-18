@@ -494,10 +494,13 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], u
 ///     ks takes the values 16 tq + 4 ks + 0, 1 (its k 2 tq, 2 tq + 1) and + 2, 3 (its k 2 tq + 8, + 9), so a lane's
 ///     codes of a group are one 16-byte load.
 ///   * P . V: out^T (16 values x 8 heads) = V^T (16 values x 16 cells, the codes) * (P x the cell's V scale)^T per
-///     mma, the weights as FP16 pairs hi + lo times 2^E (E per tile and scale group: the largest weight in [2^13,
-///     2^14), so no weight is an FP16 subnormal; 2^-E after).  Warp w owns the values 32 w .. + 31 (one scale group)
-///     for every cell of the tile; lane (g, tq) loads the 4 values 32 w + 4 g .. + 3 of the cells 4 tq .. + 3 (its k
-///     2 tq, 2 tq + 1, 2 tq + 8, 2 tq + 9), two mma tiles (rows: the values 32 w + 4 g + 2 t + 0 / + 1 of tile t).
+///     mma, the weights (P x V scale) as FP16 pairs hi + lo times 2^E (E per tile and scale group, from the group's
+///     largest V scale alone: that scale times 2^E in [2^13, 2^14), so the dominant weights are normal FP16; weights
+///     far below the running max, or of cells with a much smaller V scale, may still be FP16 subnormal or round to 0,
+///     which the exact FP32 exp-sum makes negligible; 2^-E after).  Warp w owns the values 32 w .. + 31 (one scale
+///     group) for every cell of the tile; lane (g, tq) loads the 4 values 32 w + 4 g .. + 3 of the cells 4 tq .. + 3
+///     (its k 2 tq, 2 tq + 1, 2 tq + 8, 2 tq + 9), two mma tiles (rows: the values 32 w + 4 g + 2 t + 0 / + 1 of tile
+///     t).
 ///   FP32 K / V (and int8 before sm_80): CUDA-core FP32 arithmetic.  Q . K: a warp per cell, each lane 8 of its
 ///   values (lane * 4 .. + 3 and 128 + lane * 4 .. + 3: two float4 / two words of int8 codes and their scales), the
 ///   heads' 8 partial sums added across the warp in one transposed butterfly (9 shuffles for the 8 sums), kGqaCpw
