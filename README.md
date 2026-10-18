@@ -1,5 +1,9 @@
 <h1 align="center">Strata</h1>
 
+> **This is a fork** of [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT). Branch `qwen36-8gb` runs
+> Qwen3.6-35B-A3B UD-Q4_K_XL with a 204,800-token context on an 8 GB laptop card (RTX 4070 Laptop), with three
+> open upstream PRs merged and new switches that are off by default. Details, numbers and what was not tested: [docs/QWEN36_8GB.md](docs/QWEN36_8GB.md).
+
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>

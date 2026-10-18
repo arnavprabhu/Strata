@@ -8,6 +8,8 @@ reads **pictures** and serves **several requests at once**, the same two options
 Measured on an AMD Radeon AI PRO R9700 32 GB (HIP, Linux, UD-Q4_K_XL, every expert in VRAM) and on an RTX 3060 12 GB (CUDA, 20 threads,
 UD-Q4_K_XL in the hybrid mode: 22-37 of 256 experts per layer in VRAM, the rest on the CPU), llama.cpp 972b5fc on the same files.
 
+On an 8 GB card with a 204,800-token context (`--kv int8` and opt-in switches, this fork's branch `qwen36-8gb`): [QWEN36_8GB.md](QWEN36_8GB.md).
+
 ## Pictures
 
 The vision encoder is Unsloth's `mmproj-F16.gguf` (0.9 GB, pinned revision, SHA-256 checked by setup): a 27-layer ViT with a 2x2 merger,
