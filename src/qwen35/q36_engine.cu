@@ -277,6 +277,12 @@ struct RowSel {
     float* const* vc = nullptr;
     int rot = 0;                     // --kv k8v4 with the Hadamard rotation: the V cells are stored rotated (k_attn_prep
                                      // rotates them, the merges rotate the attention output back); any other store: 0
+    // STRATA_Q36_MTP_WIN (k_attn_gqa and its merge only): the MTP block's attention sees the cells < sink and the last
+    // `win` cells of the row (win 0: all of them)
+    int win = 0, sink = 0;
+    // STRATA_Q36_ATTN_GQA_ROWS (k_attn_gqa launched next to k_attn_gqa_w, in a graph): k_attn_gqa leaves a launch whose
+    // last row has multi_min cells or more to k_attn_gqa_w (0: it runs them all)
+    int multi_min = 0;
 };
 
 /// The KV cache's int8 mode (--kv int8 / STRATA_Q36_KV=int8): kKVG values share one FP16 scale (the group's absmax /
@@ -596,7 +602,7 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], u
 ///   V4 (--kv k8v4, see kKVG4): the V cells' 4-bit codes widened to int8 codes in registers (nib4_i8x4), and the scale
 ///   groups are 32 values: warp w's own values, so P . V takes one group's (signed) scale per warp.
 constexpr int kGqaG = 8, kGqaTile = 256, kGqaCpw = 2;
-template <bool KI8, bool VI8, bool V4 = false>
+template <bool KI8, bool VI8, bool V4 = false, bool EXT = false>   // EXT: RowSel::win / multi_min are honoured
 __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const float* kc, const float* vc, const int32_t* pos0,
                                                        int t0, int H, int HKV, int ctx, float scale, int n_chunk, int cc,
                                                        float* pacc, float* pm, float* pl, RowSel rs) {
@@ -622,6 +628,16 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
     const int p0 = c * cc;
     if (p0 >= npos) return;
     const int pend = min(p0 + cc, npos);
+    // (EXT: the MTP window - the visible cells are < wsink and >= wlo, a chunk or tile without one is skipped; without a
+    // window wsink = wlo = 0 and every cell is visible - and k_attn_gqa_w's launches, see RowSel::multi_min.  Without EXT
+    // none of it is compiled: the kernel is the one without these options)
+    int wsink = 0, wlo = 0;
+    if constexpr (EXT) {
+        if (rs.multi_min > 0 && *pos0 + t0 + (int) gridDim.x >= rs.multi_min) return;
+        if (rs.win > 0) wsink = rs.sink, wlo = max(rs.sink, npos - rs.win);
+        if (p0 >= wsink && pend <= wlo) return;
+    }
+    const auto vis = [&](int cell) { return !EXT || cell < wsink || cell >= wlo; };
     const int j = threadIdx.x, lane = j & 31, w = j >> 5, g = lane >> 2, tq = lane & 3;
     const int qa = lane * 4, qb = 128 + lane * 4;   // !MK: a lane's values of a cell
     const float* qh = q + ((size_t) t * H + kvh * G) * HD;
@@ -653,14 +669,16 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
     const size_t cb = (size_t) kvh * ctx;   // the KV head's first cell
     for (int tp = p0; tp < pend; tp += TL) {
         const int n = min(TL, pend - tp), n16 = (n + 15) & ~15;
+        if constexpr (EXT)
+            if (tp >= wsink && tp + n <= wlo) continue;   // (the MTP window: no visible cell in this tile)
         float sv[NV];   // MV: thread j's cell's V scales
         if constexpr (MV && V4) {
-            const uint4 r = j < n ? *reinterpret_cast<const uint4*>(kv4_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NV) : make_uint4(0, 0, 0, 0);
+            const uint4 r = j < n && vis(tp + j) ? *reinterpret_cast<const uint4*>(kv4_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NV) : make_uint4(0, 0, 0, 0);
             const __half* h8 = reinterpret_cast<const __half*>(&r);
 #pragma unroll
             for (int gb = 0; gb < NV; ++gb) sv[gb] = __half2float(h8[gb]);
         } else if constexpr (MV) {
-            const uint2 r = j < n ? *reinterpret_cast<const uint2*>(kv8_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NG) : make_uint2(0, 0);
+            const uint2 r = j < n && vis(tp + j) ? *reinterpret_cast<const uint2*>(kv8_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NG) : make_uint2(0, 0);
             const __half* h4 = reinterpret_cast<const __half*>(&r);
 #pragma unroll
             for (int gb = 0; gb < NG; ++gb) sv[gb] = __half2float(h4[gb]);
@@ -777,12 +795,13 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
         __syncthreads();
         {   // the online softmax: warp w for head w (MV: the weights past the tile up to n16 zero)
             float mx = -INFINITY;
-            for (int k = lane; k < n; k += 32) mx = fmaxf(mx, S(k, w));
+            for (int k = lane; k < n; k += 32)
+                if (vis(tp + k)) mx = fmaxf(mx, S(k, w));
             for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 32));
             const float mo = mh[w], mn = fmaxf(mo, mx);
             float su = 0.f;
             for (int k = lane; k < (MV ? n16 : n); k += 32) {
-                const float e = k < n ? expf(S(k, w) - mn) : 0.f;
+                const float e = k < n && vis(tp + k) ? expf(S(k, w) - mn) : 0.f;
                 S(k, w) = e;
                 su += e;
             }
@@ -920,6 +939,328 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
         pl[o] = lh[j];
     }
 }
+/// STRATA_Q36_ATTN_GQA_ROWS=2 / 4: k_attn_gqa for the rows of a window: one block per (KV head, chunk of cc cells) takes
+/// up to TW consecutive query rows (a verify window's, a prompt tail's: row r at cell *pos0 + t0 + g0 + r, its own causal
+/// limit) and reads each K / V tile of the chunk ONCE for all of them, where k_attn_gqa's block per row reads it TW times
+/// (from L2 at best: the blocks of a chunk are adjacent).  Every row gets exactly the bits k_attn_gqa gives it alone
+/// (a decode step and a verify window stay the same rows, see layer()):
+///   * Q . K: the K tile's A fragments (the codes exact in FP16) are built once per 16 cells and 16 values and applied
+///     to every row's Q fragments in turn (the mmas of one row are k_attn_gqa's, in its order);
+///   * the online softmax is per row, over the row's own cells of the tile (cell < the row's causal limit), on the same
+///     256-cell tiles from the chunk's first cell; a row without a cell in a tile leaves its state alone;
+///   * P . V: the V tile's A fragments once per 16 cells, applied to every row's weights.  The weights' power of two
+///     (2^E, from the tile's largest V scale of the warp's group) is the row's own: the largest over the row's cells,
+///     as k_attn_gqa has it for that row alone (a row of the last tile with fewer cells than its neighbours' takes its
+///     own).  The cells a row does not see have weight 0 (and the V scale and codes of real cells), exact zeros.
+/// Same partials as k_attn_gqa (row (g0 + r) * H + head, chunk c; a row with no cell in the chunk writes none), so
+/// k_attn_merge_cc is unchanged.  Needs int8 K and int8 / 4-bit V and sm_80+ (the host checks), no MTP window, no batch
+/// rows.  The loads of a tile (K for both 16-cell rounds of a warp, V for all of the tile's cells, the V scales) are
+/// issued before the first mma uses any: the block is one per SM at TW 4 (smem 73 / 77 KB), so nothing else hides its
+/// memory latency.  `nt` rows in the launch (the window's), `min_cells`: leave a launch whose last row has fewer cells
+/// to k_attn_gqa (the graph's other launch, RowSel::multi_min).
+template <bool V4, int TW>
+constexpr size_t gqa_w_smem_bytes() {
+    constexpr int NV = V4 ? 256 / kKVG4 : 256 / kKVG;
+    return (size_t) 4 * ((size_t) TW * kGqaG * (kGqaTile + 16) + (size_t) TW * kGqaG * 256 + (size_t) NV * kGqaTile +
+                         (size_t) 8 * NV + (size_t) TW * 8 * NV + (size_t) 3 * TW * kGqaG + (size_t) TW * NV);
+}
+template <bool V4, int TW>
+__global__ void __launch_bounds__(kThreads, TW > 2 ? 1 : 2)
+k_attn_gqa_w(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int g0, int nr, int nt, int H,
+             int HKV, int ctx, float scale, int n_chunk, int cc, float* pacc, float* pm, float* pl, int min_cells) {
+#if STRATA_Q36_GQA_MMA
+    constexpr int HD = 256, G = kGqaG, TL = kGqaTile, NG = HD / kKVG, NW = kThreads / 32;
+    constexpr int NV = V4 ? HD / kKVG4 : NG;   // the V scale groups of a cell
+    constexpr int LS = TL + 16;                // a head's row of weights (padded as in k_attn_gqa)
+    constexpr bool VPF = TW > 2;               // the V loads of the whole tile before the first mma
+    extern __shared__ __align__(16) unsigned char gqa_w_smem[];
+    float* spb = reinterpret_cast<float*>(gqa_w_smem);   // [TW][G][LS]: row r's scores, then its weights exp(s - m)
+    float* qs = spb + TW * G * LS;                        // [TW][G * HD]: row r's Q fragments (see k_attn_gqa)
+    float* sraw = qs + TW * G * HD;                       // [NV][TL]: the tile's V scales (0 past its cells)
+    float* smx = sraw + NV * TL;                          // [NW][NV]: each warp's largest V scale (magnitude) per group
+    float* smp = smx + NW * NV;                           // [TW][NW][NV]: the same over the cells of a row with fewer
+    float* mh = smp + TW * NW * NV;                       // [TW][G]
+    float* lh = mh + TW * G;
+    float* ah = lh + TW * G;
+    int* sex = reinterpret_cast<int*>(ah + TW * G);       // [TW][NV]: the exponent of the largest scale (frexpf)
+    const int kvh = blockIdx.y, c = blockIdx.z;
+    const int tb = t0 + g0;                    // the first row's token
+    const int pr0 = *pos0 + tb;                // its cell
+    const int npos_max = pr0 + nr;             // the last row's cell count
+    const int p0 = c * cc;
+    if (p0 >= npos_max || *pos0 + t0 + nt < min_cells) return;
+    const int pend_max = min(p0 + cc, npos_max);
+    const int j = threadIdx.x, lane = j & 31, w = j >> 5, g = lane >> 2, tq = lane & 3;
+#pragma unroll
+    for (int r = 0; r < TW; ++r) {
+        if (r >= nr) continue;
+        const float* qh = q + ((size_t) (tb + r) * H + kvh * G) * HD;
+        uint4* qf = reinterpret_cast<uint4*>(qs + (size_t) r * G * HD);
+        for (int x = j; x < NG * 4 * 32; x += kThreads) {
+            const int l = x & 31, ks = (x >> 5) & 3, gb = x >> 7;
+            const float4 v = *reinterpret_cast<const float4*>(qh + (size_t) (l >> 2) * HD + gb * kKVG + 16 * (l & 3) + 4 * ks);
+            uint4 f;
+            f2_h2x2(v.x, v.y, f.x, f.z);
+            f2_h2x2(v.z, v.w, f.y, f.w);
+            qf[x] = f;
+        }
+    }
+    if (j < TW * G) {
+        mh[j] = -INFINITY;
+        lh[j] = 0.f;
+    }
+    __syncthreads();
+    float acc[TW][4][2];   // row r: [tile t * 2 + head 2 tq / 2 tq + 1][..], see k_attn_gqa
+#pragma unroll
+    for (int r = 0; r < TW; ++r)
+#pragma unroll
+        for (int h = 0; h < 4; ++h) acc[r][h][0] = acc[r][h][1] = 0.f;
+    const size_t cb = (size_t) kvh * ctx;   // the KV head's first cell
+    const __half* ksp = kv8_scales(kc, HKV, ctx, HD);
+    for (int tp = p0; tp < pend_max; tp += TL) {
+        int nrw[TW], n = 0;   // row r's cells in this tile (0: none), n the most (the last row's)
+#pragma unroll
+        for (int r = 0; r < TW; ++r) {
+            nrw[r] = r < nr ? max(0, min(TL, min(p0 + cc, pr0 + r + 1) - tp)) : 0;
+            n = max(n, nrw[r]);
+        }
+        const int nz = n > TL / 2 ? TL : TL / 2;   // the weights are written (zero past a row's cells) and the V tile read up to nz
+        // ---- the loads of the tile: V scales (thread j's cell), K (warp w: the 16-cell rows w, w + 8), V (all cells)
+        float sv[NV];
+        if constexpr (V4) {
+            const uint4 r = j < n ? *reinterpret_cast<const uint4*>(kv4_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NV) : make_uint4(0, 0, 0, 0);
+            const __half* h8 = reinterpret_cast<const __half*>(&r);
+#pragma unroll
+            for (int gb = 0; gb < NV; ++gb) sv[gb] = __half2float(h8[gb]);
+        } else {
+            const uint2 r = j < n ? *reinterpret_cast<const uint2*>(kv8_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NG) : make_uint2(0, 0);
+            const __half* h4 = reinterpret_cast<const __half*>(&r);
+#pragma unroll
+            for (int gb = 0; gb < NV; ++gb) sv[gb] = __half2float(h4[gb]);
+        }
+        uint4 c0[VPF ? 2 : 1][NG], c1[VPF ? 2 : 1][NG];   // VPF: both rounds' K loaded now, else each round's in its turn
+        float s0[VPF ? 2 : 1][NG], s1[VPF ? 2 : 1][NG];
+        const auto ldk = [&](int rd, int sl) {   // (cells past the tile: the last one's, not used)
+            const int m0 = w * 16 + rd * 128;
+            const size_t p0c = cb + tp + min(m0 + g, n - 1), p1c = cb + tp + min(m0 + g + 8, n - 1);
+            const int8_t* k0p = ((const int8_t*) kc) + p0c * HD + 16 * tq;
+            const int8_t* k1p = ((const int8_t*) kc) + p1c * HD + 16 * tq;
+#pragma unroll
+            for (int gb = 0; gb < NG; ++gb) {
+                c0[sl][gb] = *reinterpret_cast<const uint4*>(k0p + gb * kKVG);
+                c1[sl][gb] = *reinterpret_cast<const uint4*>(k1p + gb * kKVG);
+                s0[sl][gb] = __half2float(ksp[p0c * NG + gb]);
+                s1[sl][gb] = __half2float(ksp[p1c * NG + gb]);
+            }
+        };
+        if constexpr (VPF) {
+            ldk(0, 0);
+            ldk(1, 1);
+        }
+        const int8_t* vb = ((const int8_t*) vc) + (cb + tp) * (V4 ? HD / 2 : HD) + (V4 ? 16 * w + 2 * g : 32 * w + 4 * g);
+        // the lane's codes of the cells 16 it + 4 tq + 0 .. 3 (V4: the 2 bytes of nibbles; a cell past the tile: the last one's)
+        const auto ldv = [&](int it, uint32_t (&x)[4]) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const size_t cell = min(it * 16 + 4 * tq + i, n - 1);
+                x[i] = V4 ? (uint32_t) *reinterpret_cast<const unsigned short*>(vb + cell * (HD / 2))
+                          : *reinterpret_cast<const uint32_t*>(vb + cell * HD);
+            }
+        };
+        uint32_t xr[VPF ? TL / 16 : 1][4];   // VPF: all of the tile's, loaded now (the registers of TW 4's one block per SM)
+        if constexpr (VPF) {
+#pragma unroll
+            for (int it = 0; it < TL / 16; ++it)
+                if (it < TL / 32 || n > TL / 2) ldv(it, xr[it]);
+        }
+#pragma unroll
+        for (int gb = 0; gb < NV; ++gb) sraw[gb * TL + j] = sv[gb];
+        // ---- Q . K
+#pragma unroll
+        for (int rd = 0; rd < 2; ++rd) {
+            const int m0 = w * 16 + rd * 128;
+            if (m0 >= n) continue;
+            constexpr int SL0 = 0;
+            const int sl = VPF ? rd : SL0;
+            if constexpr (!VPF) ldk(rd, 0);
+            const int r0 = m0 + g, r1 = m0 + g + 8;
+            float d[TW][4];
+#pragma unroll
+            for (int r = 0; r < TW; ++r) d[r][0] = d[r][1] = d[r][2] = d[r][3] = 0.f;
+#pragma unroll
+            for (int gb = 0; gb < NG; ++gb) {
+                float e[TW][4];
+#pragma unroll
+                for (int r = 0; r < TW; ++r) e[r][0] = e[r][1] = e[r][2] = e[r][3] = 0.f;
+                const uint32_t w0[4] = {c0[sl][gb].x, c0[sl][gb].y, c0[sl][gb].z, c0[sl][gb].w};
+                const uint32_t w1[4] = {c1[sl][gb].x, c1[sl][gb].y, c1[sl][gb].z, c1[sl][gb].w};
+#pragma unroll
+                for (int ks = 0; ks < 4; ++ks) {
+                    uint32_t a[4];
+                    i8x4_h2(w0[ks], a[0], a[2]);
+                    i8x4_h2(w1[ks], a[1], a[3]);
+#pragma unroll
+                    for (int r = 0; r < TW; ++r) {
+                        if (r >= nr) continue;
+                        const uint4 bq = reinterpret_cast<const uint4*>(qs + (size_t) r * G * HD)[(gb * 4 + ks) * 32 + lane];
+                        mma_f16(e[r], a, bq.z, bq.w);   // lo, then hi
+                        mma_f16(e[r], a, bq.x, bq.y);
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < TW; ++r) {
+                    d[r][0] = fmaf(e[r][0], s0[sl][gb], d[r][0]), d[r][1] = fmaf(e[r][1], s0[sl][gb], d[r][1]);
+                    d[r][2] = fmaf(e[r][2], s1[sl][gb], d[r][2]), d[r][3] = fmaf(e[r][3], s1[sl][gb], d[r][3]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < TW; ++r) {
+                if (r >= nr) continue;
+                float* Sr = spb + (size_t) r * G * LS;
+                if (r0 < n) Sr[(2 * tq) * LS + r0] = d[r][0] * scale, Sr[(2 * tq + 1) * LS + r0] = d[r][1] * scale;
+                if (r1 < n) Sr[(2 * tq) * LS + r1] = d[r][2] * scale, Sr[(2 * tq + 1) * LS + r1] = d[r][3] * scale;
+            }
+        }
+        // each warp's largest V scale per group over the tile, and over the cells of a row with fewer (the window's first
+        // rows in the tile that holds its last cells)
+#pragma unroll
+        for (int gb = 0; gb < NV; ++gb) {
+            float mv = V4 ? fabsf(sv[gb]) : sv[gb];   // (V4: the scales are signed)
+            for (int o = 16; o > 0; o >>= 1) mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, o, 32));
+            if (lane == 0) smx[w * NV + gb] = mv;
+        }
+#pragma unroll
+        for (int r = 0; r < TW; ++r) {
+            if (nrw[r] <= 0 || nrw[r] >= n) continue;
+#pragma unroll
+            for (int gb = 0; gb < NV; ++gb) {
+                float mv = j < nrw[r] ? (V4 ? fabsf(sv[gb]) : sv[gb]) : 0.f;
+                for (int o = 16; o > 0; o >>= 1) mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, o, 32));
+                if (lane == 0) smp[(r * NW + w) * NV + gb] = mv;
+            }
+        }
+        __syncthreads();
+        // ---- the online softmax, row by row: warp w for head w
+        if (j < TW * NV) {   // thread (r, gb): the exponent of row r's largest V scale of group gb
+            const int r = j / NV, gb = j - r * NV;
+            const int nj = r < nr ? max(0, min(TL, min(p0 + cc, pr0 + r + 1) - tp)) : 0;
+            if (nj > 0) {
+                const float* src = nj == n ? smx : smp + r * NW * NV;
+                float mv = src[gb];
+                for (int x = 1; x < NW; ++x) mv = fmaxf(mv, src[x * NV + gb]);
+                int ex;
+                frexpf(mv, &ex);   // mv in [2^(ex - 1), 2^ex)
+                sex[j] = ex;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < TW; ++r) {
+            if (nrw[r] <= 0) continue;
+            float* Sw = spb + (size_t) r * G * LS + w * LS;
+            float mx = -INFINITY;
+            for (int k = lane; k < nrw[r]; k += 32) mx = fmaxf(mx, Sw[k]);
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 32));
+            const float mo = mh[r * G + w], mn = fmaxf(mo, mx);
+            float su = 0.f;
+            for (int k = lane; k < nz; k += 32) {
+                const float e = k < nrw[r] ? expf(Sw[k] - mn) : 0.f;
+                Sw[k] = e;
+                su += e;
+            }
+            for (int o = 16; o > 0; o >>= 1) su += __shfl_xor_sync(0xffffffffu, su, o, 32);
+            __syncwarp();   // every lane has read mh[] for its head before lane 0 moves it
+            if (lane == 0) {
+                const float al = expf(mo - mn);   // 0 on the first tile (mo = -inf)
+                ah[r * G + w] = al;
+                mh[r * G + w] = mn;
+                lh[r * G + w] = lh[r * G + w] * al + su;
+            }
+        }
+        __syncthreads();
+        // ---- P . V
+        {
+            const int gw = V4 ? w : w >> 1;   // the warp's scale group
+            float inv[TW], p2[TW];
+#pragma unroll
+            for (int r = 0; r < TW; ++r) {
+                const int ex = nrw[r] > 0 ? sex[r * NV + gw] : 14;
+                inv[r] = ldexpf(1.f, ex - 14);
+                p2[r] = ldexpf(1.f, 14 - ex);   // (a cell's V scale times this is k_attn_gqa's svs, exactly)
+            }
+            float e[TW][2][4];
+#pragma unroll
+            for (int r = 0; r < TW; ++r)
+#pragma unroll
+                for (int tt = 0; tt < 2; ++tt) e[r][tt][0] = e[r][tt][1] = e[r][tt][2] = e[r][tt][3] = 0.f;
+#pragma unroll
+            for (int it = 0; it < TL / 16; ++it) {
+                if (it >= TL / 32 && n <= TL / 2) continue;
+                const int k0 = it * 16, kq = k0 + 4 * tq;   // the lane's cells kq .. + 3
+                uint32_t x[4];
+                if constexpr (VPF) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) x[i] = xr[it][i];
+                } else {
+                    ldv(it, x);
+                }
+                if constexpr (V4) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) x[i] = nib4_i8x4(x[i]);
+                }
+                uint32_t a[2][4];
+#pragma unroll
+                for (int tt = 0; tt < 2; ++tt) {   // value 2 tt (rows g) and 2 tt + 1 (rows g + 8) of the lane's 4
+                    a[tt][0] = i8x2_h2(__byte_perm(x[0], x[1], 0x0400u + 0x0202u * tt));
+                    a[tt][1] = i8x2_h2(__byte_perm(x[0], x[1], 0x0501u + 0x0202u * tt));
+                    a[tt][2] = i8x2_h2(__byte_perm(x[2], x[3], 0x0400u + 0x0202u * tt));
+                    a[tt][3] = i8x2_h2(__byte_perm(x[2], x[3], 0x0501u + 0x0202u * tt));
+                }
+                const float4 sr = *reinterpret_cast<const float4*>(&sraw[gw * TL + kq]);
+#pragma unroll
+                for (int r = 0; r < TW; ++r) {
+                    if (nrw[r] <= k0) continue;   // (k_attn_gqa's row stops at its last 16 cells)
+                    const float4 pw = *reinterpret_cast<const float4*>(&spb[(size_t) r * G * LS + g * LS + kq]);
+                    uint32_t bh0, bl0, bh1, bl1;
+                    f2_h2x2(pw.x * (sr.x * p2[r]), pw.y * (sr.y * p2[r]), bh0, bl0);
+                    f2_h2x2(pw.z * (sr.z * p2[r]), pw.w * (sr.w * p2[r]), bh1, bl1);
+#pragma unroll
+                    for (int tt = 0; tt < 2; ++tt) {
+                        mma_f16(e[r][tt], a[tt], bl0, bl1);   // lo, then hi
+                        mma_f16(e[r][tt], a[tt], bh0, bh1);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < TW; ++r) {
+                if (nrw[r] <= 0) continue;
+                const float a0 = ah[r * G + 2 * tq], a1 = ah[r * G + 2 * tq + 1];
+#pragma unroll
+                for (int tt = 0; tt < 2; ++tt) {   // acc[2 tt]: head 2 tq (rows g, g + 8), acc[2 tt + 1]: head 2 tq + 1
+                    acc[r][2 * tt][0] = fmaf(acc[r][2 * tt][0], a0, e[r][tt][0] * inv[r]);
+                    acc[r][2 * tt][1] = fmaf(acc[r][2 * tt][1], a0, e[r][tt][2] * inv[r]);
+                    acc[r][2 * tt + 1][0] = fmaf(acc[r][2 * tt + 1][0], a1, e[r][tt][1] * inv[r]);
+                    acc[r][2 * tt + 1][1] = fmaf(acc[r][2 * tt + 1][1], a1, e[r][tt][3] * inv[r]);
+                }
+            }
+        }
+        __syncthreads();   // the weights and scales read out before the next tile's scores
+    }
+    // lane (g, tq): the values 32 w + 4 g .. + 3 of the heads 2 tq, 2 tq + 1, of each row that has a cell in the chunk
+    const int dv = 32 * w + 4 * g;
+#pragma unroll
+    for (int r = 0; r < TW; ++r) {
+        if (r >= nr || p0 >= pr0 + r + 1) continue;
+        const size_t rb = (size_t) (g0 + r) * H + kvh * G;
+        *reinterpret_cast<float4*>(pacc + ((rb + 2 * tq) * n_chunk + c) * HD + dv) = make_float4(acc[r][0][0], acc[r][0][1], acc[r][2][0], acc[r][2][1]);
+        *reinterpret_cast<float4*>(pacc + ((rb + 2 * tq + 1) * n_chunk + c) * HD + dv) = make_float4(acc[r][1][0], acc[r][1][1], acc[r][3][0], acc[r][3][1]);
+        if (j < G) {
+            const size_t o = (rb + j) * n_chunk + c;
+            pm[o] = mh[r * G + j];
+            pl[o] = lh[r * G + j];
+        }
+    }
+#endif
+}
 /// k_attn_merge for chunks of cc cells (k_attn_gqa's partials): grid (n_rows), block HD.
 __global__ void k_attn_merge_cc(const float* pacc, const float* pm, const float* pl, const float* gate,
                                 const int32_t* pos0, int t0, int H, int n_chunk, int cc, float* out, RowSel rs) {
@@ -928,10 +1269,13 @@ __global__ void k_attn_merge_cc(const float* pacc, const float* pm, const float*
     const int row = blockIdx.x, t = t0 + row / H, h = row % H, d = threadIdx.x;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     const int nc = (npos + cc - 1) / cc;
+    const int wsink = rs.win > 0 ? rs.sink : 0, wlo = rs.win > 0 ? max(rs.sink, npos - rs.win) : 0;   // (see k_attn_gqa)
     float M = -INFINITY;
-    for (int c = 0; c < nc; ++c) M = fmaxf(M, pm[(size_t) row * n_chunk + c]);
+    for (int c = 0; c < nc; ++c)
+        if (c * cc < wsink || min(c * cc + cc, npos) > wlo) M = fmaxf(M, pm[(size_t) row * n_chunk + c]);
     float num = 0.f, den = 0.f;
     for (int c = 0; c < nc; ++c) {
+        if (c * cc >= wsink && min(c * cc + cc, npos) <= wlo) continue;   // (a chunk k_attn_gqa skipped)
         const size_t o = (size_t) row * n_chunk + c;
         const float w = expf(pm[o] - M);
         num += w * pacc[o * HD + d];
@@ -2218,6 +2562,7 @@ struct Engine {
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
+        gqa_setup();
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
@@ -2400,6 +2745,67 @@ struct Engine {
         const int v = c != nullptr ? std::atoi(c) : 1024;
         return std::max(1, std::min(16, v / kGqaTile)) * kGqaTile;
     }();
+    // STRATA_Q36_ATTN_GQA_ROWS=2 | 4 (with STRATA_Q36_ATTN_GQA=1): the rows of a window (2 or more query rows: a verify
+    // window, an MTP call with redone rows) share each K / V tile: k_attn_gqa_w, a block per (KV head, chunk) for up to 2 / 4
+    // rows, the same bits per row as k_attn_gqa (see there).  Only once the last row has STRATA_Q36_ATTN_GQA_ROWS_MIN
+    // cells (default 16384): below that the grid of k_attn_gqa (a block per row) fills the card better.  Default 0: off.
+    int gqa_rw = [] {
+        const char* e = std::getenv("STRATA_Q36_ATTN_GQA_ROWS");
+        const int v = e != nullptr ? std::atoi(e) : 0;
+        return v >= 4 ? 4 : v >= 2 ? 2 : 0;
+    }();
+    int gqa_rw_min = [] {
+        const char* e = std::getenv("STRATA_Q36_ATTN_GQA_ROWS_MIN");
+        return e != nullptr ? std::max(1, std::atoi(e)) : 16384;
+    }();
+    // STRATA_Q36_MTP_WIN=N (with STRATA_Q36_ATTN_GQA=1; default 0: off): the MTP block's attention reads the first
+    // STRATA_Q36_MTP_SINK (default 64) cells and the last N cells of each row only.  Its drafts are verified by the main
+    // model, so only the share of accepted drafts can change; the block's own K / V cache is written for every position
+    // (k_attn_prep) as before.
+    int mtp_win = [] {
+        const char* e = std::getenv("STRATA_Q36_MTP_WIN");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+    }();
+    int mtp_sink = [] {
+        const char* e = std::getenv("STRATA_Q36_MTP_SINK");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 64;
+    }();
+    /// The checks and the shared-memory opt-in of those two options (after the --kv mode is known)
+    void gqa_setup() {
+        const auto& g = m->g;
+        const bool gqa_ok = gqa_cc > 0 && g.n_head == (int64_t) kGqaG * g.n_head_kv && g.head_dim == 256;
+        if (!gqa_ok && (gqa_rw > 0 || mtp_win > 0)) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_ATTN_GQA_ROWS / STRATA_Q36_MTP_WIN need STRATA_Q36_ATTN_GQA=1 (and 8 query "
+                         "heads per KV head, head dim 256): ignored\n");
+            gqa_rw = 0;
+            mtp_win = 0;
+        }
+        if (gqa_rw > 0) {
+            int dev = 0, major = 0;
+            CK(cudaGetDevice(&dev));
+            CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+            if (major < 8 || !kv_k8 || !kv_v8) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_ATTN_GQA_ROWS needs --kv int8 or k8v4 and an sm_80+ card: ignored\n");
+                gqa_rw = 0;
+            } else {
+                kv4([&](auto k8c, auto v8c, auto v4c) {
+                    constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
+                    if constexpr (K8 && V8) {
+                        CK(cudaFuncSetAttribute(k_attn_gqa_w<V4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                (int) gqa_w_smem_bytes<V4, 2>()));
+                        if (gqa_rw >= 4)
+                            CK(cudaFuncSetAttribute(k_attn_gqa_w<V4, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    (int) gqa_w_smem_bytes<V4, 4>()));
+                    }
+                });
+                std::fprintf(stderr, "strata-q36: attention rows of a window share the K / V tiles (up to %d rows per block) from %d "
+                             "cells on\n", gqa_rw, gqa_rw_min);
+            }
+        }
+        if (mtp_win > 0)
+            std::fprintf(stderr, "strata-q36: the MTP block's attention reads the first %d cells and the last %d only\n",
+                         mtp_sink, mtp_win);
+    }
     float* vbuf = nullptr;                       // verify scratch
     long long v_calls = 0, v_bad = 0;
     std::map<std::string, long long> v_by;   // mismatches per check
@@ -2871,14 +3277,50 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int ncg = (ctx + gqa_cc - 1) / gqa_cc;   // <= n_chunk: the partials keep their row stride
                     const int nc = graph_mode ? ncg : (int) std::min<int64_t>(ncg, (p0 + t0 + nt + gqa_cc - 1) / gqa_cc);
+                    RowSel rsg = rs;   // (STRATA_Q36_MTP_WIN: the MTP block's attention is a window; its merge skips what k_attn_gqa did)
+                    if (li == m->layers.size() && mtp_win > 0) rsg.win = mtp_win, rsg.sink = mtp_sink;
+                    // STRATA_Q36_ATTN_GQA_ROWS: the rows of a window (not batch rows of sessions, not a window) share the tiles
+                    const bool multi = gqa_rw >= 2 && nt >= 2 && !rows_mode && rsg.win == 0 && T <= kVerify;
+                    const int last_cells = (int) (p0 + t0 + nt);   // the last row's cells (eager: p0 is its row 0's cell)
+                    // (a graph is one for every position: both kernels are launched, each leaves the other's positions)
+                    const bool use_w = multi && (graph_mode || last_cells >= gqa_rw_min), use_1 = !use_w || graph_mode;
+                    if (use_w && graph_mode) rsg.multi_min = gqa_rw_min;
                     kv4([&](auto k8c, auto v8c, auto v4c) {
                         constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
-                        k_attn_gqa<K8, V8, V4><<<dim3(nt, HKV, nc), kThreads, 0, st>>>(q, rows_mode ? nullptr : kc[li],
-                                                                                  rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
-                                                                                  1.0f / sqrtf((float) HD), n_chunk, gqa_cc, pacc, pm,
-                                                                                  pl, rs);
+                        const float sc = 1.0f / sqrtf((float) HD);
+                        if (use_1 && (rsg.win > 0 || rsg.multi_min > 0))
+                            k_attn_gqa<K8, V8, V4, true><<<dim3(nt, HKV, nc), kThreads, 0, st>>>(
+                                q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx, sc, n_chunk,
+                                gqa_cc, pacc, pm, pl, rsg);
+                        else if (use_1)
+                            k_attn_gqa<K8, V8, V4><<<dim3(nt, HKV, nc), kThreads, 0, st>>>(
+                                q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx, sc, n_chunk,
+                                gqa_cc, pacc, pm, pl, rsg);
+                        if constexpr (K8 && V8) {
+                            if (use_w) {
+                                static bool said = false;   // (once: the launch is there, for a log that wants to see it)
+                                if (!said) {
+                                    said = true;
+                                    std::fprintf(stderr, "strata-q36: k_attn_gqa_w launched (%d rows, %s)\n", nt, graph_mode ? "in a graph" : "eager");
+                                }
+                                const int ng = (nt + gqa_rw - 1) / gqa_rw;   // groups of nearly even size (5 rows: 3 + 2)
+                                for (int a = 0, done = 0; a < ng; ++a) {
+                                    const int nr = (nt - done + (ng - a) - 1) / (ng - a);
+                                    const int min_cells = graph_mode ? gqa_rw_min : 0;
+                                    if (nr <= 2)
+                                        k_attn_gqa_w<V4, 2><<<dim3(1, HKV, nc), kThreads, gqa_w_smem_bytes<V4, 2>(), st>>>(
+                                            q, kc[li], vc[li], dpos, t0, done, nr, nt, H, HKV, ctx, sc, n_chunk, gqa_cc, pacc, pm, pl,
+                                            min_cells);
+                                    else
+                                        k_attn_gqa_w<V4, 4><<<dim3(1, HKV, nc), kThreads, gqa_w_smem_bytes<V4, 4>(), st>>>(
+                                            q, kc[li], vc[li], dpos, t0, done, nr, nt, H, HKV, ctx, sc, n_chunk, gqa_cc, pacc, pm, pl,
+                                            min_cells);
+                                    done += nr;
+                                }
+                            }
+                        }
                     });
-                    k_attn_merge_cc<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, gqa_cc, att, rs);
+                    k_attn_merge_cc<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, gqa_cc, att, rsg);
                 }
                 for (int t0 = 0; !gqa && t0 < T; t0 += rows_per) {
                     const int nt = std::min(rows_per, T - t0);
