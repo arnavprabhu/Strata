@@ -1032,6 +1032,12 @@ __global__ void k_route_scan(const int32_t* cnt, int n_expert, int32_t* bounds, 
     bounds[n_expert] = pos;
     *max_rows = mx;
 }
+/// out[i] = b[i] - b[0] (n entries): a group of experts' bounds counted from the group's first row (a staged part's down
+/// product reads its rows in a compact layout of its own).
+__global__ void k_bounds_rel(const int32_t* b, int n, int32_t* out) {
+    const int32_t b0 = b[0];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = b[i] - b0;
+}
 __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* cur, int32_t* dst, int32_t* src,
                                 int32_t* inv) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1771,6 +1777,7 @@ struct Engine {
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
+    int32_t* rbrel = nullptr;   // STRATA_Q36_STAGE_SPLIT: a staged part's bounds from its first row ([experts per part + 1])
     void *mq_x = nullptr, *mq_hq = nullptr;
     float *mq_gu = nullptr, *mq_h = nullptr;
     __half* x16 = nullptr;
@@ -1871,6 +1878,11 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};
     int n_stage = 2;   // staging buffers: 2 double-buffered, or 1 (STRATA_Q36_SINGLE_STAGE=1, or --kv int8 short of VRAM)
+    // STRATA_Q36_STAGE_SPLIT=N: a streamed layer's experts staged in N parts (ceil(n_expert / N) experts each, by id), each
+    // staging buffer one part big: the stream's unit is (layer, part), unit u in buffer u % n_stage.  1 = whole layers.
+    int n_split = 1;
+    int stage_np() const { return (int) (((int) m->g.n_expert + n_split - 1) / n_split); }    // experts in a full part
+    int stage_parts() const { const int np = stage_np(); return ((int) m->g.n_expert + np - 1) / np; }
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -2001,6 +2013,8 @@ struct Engine {
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         const char* singlestage = std::getenv("STRATA_Q36_SINGLE_STAGE");
         n_stage = (singlestage && std::atoi(singlestage) > 0) ? 1 : 2;   // one staging buffer instead of two: halves the prompt staging VRAM
+        if (const char* sp = std::getenv("STRATA_Q36_STAGE_SPLIT"))   // a layer's experts staged in N parts: a smaller staging buffer
+            n_split = std::max(1, std::min(std::atoi(sp), (int) g.n_expert));
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
                    MMQ::fits(L.L.d_type, g.n_embd);
@@ -2013,6 +2027,7 @@ struct Engine {
             rcnt = dalloc_t<int32_t>((size_t) g.n_expert);
             rcur = dalloc_t<int32_t>((size_t) g.n_expert);
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
+            if (n_split > 1) rbrel = dalloc_t<int32_t>((size_t) stage_np() + 1);
             rmax = dalloc_t<int32_t>(1);
             ident = dalloc_t<int32_t>((size_t) ne);
             rinv = dalloc_t<int32_t>((size_t) ne);
@@ -2020,7 +2035,7 @@ struct Engine {
             MMQ::iota(ident, ne, st);
             CK(cudaMalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
             CK(cudaMalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
-            if (kv_i8 && 3 * FF <= N) {
+            if (kv_i8 && n_split == 1 && 3 * FF <= N) {   // (not staged in parts: part 1's gate+up would overwrite part 0's down rows)
                 // --kv int8: gate+up ([ne][2 FF]) and the SwiGLU ([ne][FF]) in the expert outputs' rows (eparts, [ne][N]):
                 // all three are on the one stream, the down product writes eparts after the SwiGLU's quantize read mq_h,
                 // and nothing reads eparts between the combine and the next layer's down (96 MiB less at a 2048 chunk)
@@ -2777,6 +2792,45 @@ struct Engine {
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
+            if (lhy(li) && stage_parts() > 1) {
+                // STRATA_Q36_STAGE_SPLIT: the layer's experts staged in parts of np consecutive ids; part k's rows are the
+                // sorted rows [r0, r0 + rows) (the counts are on the host: copied above).  gate+up over the part's experts
+                // (the same activations, absolute bounds), its SwiGLU rows quantized into a compact layout of their own
+                // (bounds counted from r0, the output rows through ident + r0), then the down product; each row's
+                // products are its own, so the outputs are those of one whole-layer launch where a tile's K sum is
+                // one block's (MMQ::whole_tiles)
+                const int np = stage_np(), parts = stage_parts();
+                const int32_t* cnt = h_cnt + li * g.n_expert;
+                MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+                int64_t r0 = 0;
+                for (int k = 0; k < parts; ++k) {
+                    const int e0 = k * np, n = std::min(ne, e0 + np) - e0;
+                    int64_t rows = 0, mr = 0;
+                    for (int x = e0; x < e0 + n; ++x) {
+                        rows += cnt[x];
+                        mr = std::max<int64_t>(mr, cnt[x]);
+                    }
+                    const uint8_t* wb = stream_take((int) li);
+                    if (rows > 0) {
+                        MMQ::Product gu;
+                        gu.w = wb; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
+                        gu.n = n; gu.xq = mq_x; gu.bounds = rbounds + e0; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = mr;
+                        gu.dst = mq_gu; gu.ld_dst = 2 * FF;
+                        mctx->run(gu, st);
+                        MMQ::swiglu(mq_gu + (size_t) r0 * 2 * FF, mq_h + (size_t) r0 * FF, rows, FF, false, st);
+                        MMQ::quantize(mq_h + (size_t) r0 * FF, nullptr, mq_hq, L.L.d_type, FF, FF, rows, st);
+                        k_bounds_rel<<<1, kThreads, 0, st>>>(rbounds + e0, n + 1, rbrel);
+                        MMQ::Product dn;
+                        dn.w = wb + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
+                        dn.expert_bytes = L.stride; dn.n = n; dn.xq = mq_hq; dn.bounds = rbrel; dn.ids = ident + r0;
+                        dn.total_rows = rows; dn.max_rows = mr; dn.dst = eparts; dn.ld_dst = N;
+                        mctx->run(dn, st);
+                    }
+                    stream_done();
+                    r0 += rows;
+                }
+                prow = rinv;
+            } else {
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             MMQ::Product gu;
@@ -2793,6 +2847,7 @@ struct Engine {
             mctx->run(dn, st);
             if (lhy(li)) stream_done();
             prow = rinv;
+            }
         } else {
             group_entries(L, nullptr, T);
             if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
@@ -2910,48 +2965,56 @@ struct Engine {
     // ---- the hybrid mode
     const Layer& layer_at(int li) const { return li < (int) m->layers.size() ? m->layers[(size_t) li] : m->mtp; }
 
-    /// A streamed forward over the state indices `seq`: the first n_stage layers' experts start copying now.
+    /// A streamed forward over the state indices `seq`: the first n_stage units' experts start copying now.  A unit is one
+    /// part (STRATA_Q36_STAGE_SPLIT; the whole layer without it) of one layer: unit u is layer seq[u / parts], part u % parts.
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
         stream_pos = 0;
-        for (int i = 0; i < n_stage && i < (int) seq.size(); ++i) stream_kick(i);
+        const int n_units = (int) seq.size() * stage_parts();
+        for (int i = 0; i < n_stage && i < n_units; ++i) stream_kick(i);
     }
-    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % n_stage, after its last reader
+    void stream_kick(int i) {   // the i-th unit into staging buffer i % n_stage, after its last reader
         const int b = i % n_stage;
-        const Layer& L = layer_at(stream_seq[(size_t) i]);
+        const int parts = stage_parts(), np = stage_np();
+        const Layer& L = layer_at(stream_seq[(size_t) (i / parts)]);
+        const int ne = (int) m->g.n_expert;
+        const int e0 = (i % parts) * np, e1 = std::min(ne, e0 + np);   // the unit's experts [e0, e1), at stage[b] + (x - e0) * stride
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
         // host memory (the first version: PCIe-bound)
         static const bool all = std::getenv("STRATA_Q36_STREAM_ALL") != nullptr;
-        const int ne = (int) m->g.n_expert;
-        const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
+        const Hy& H = hy[(size_t) stream_seq[(size_t) (i / parts)]];
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
         if (all || 2 * L.n_slots < ne) {
-            CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
+            CK(cudaMemcpyAsync(stage[b], L.hblobs + (size_t) e0 * L.stride, L.stride * (size_t) (e1 - e0), cudaMemcpyHostToDevice,
+                               cst));
         } else {
-            for (int x = 0; x < ne;) {
+            for (int x = e0; x < e1;) {
                 const bool dev = H.slot_of[(size_t) x] >= 0;
                 int y = x + 1;
                 if (dev)   // consecutive slots holding consecutive experts
-                    while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
+                    while (y < e1 && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
                 else
-                    while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
+                    while (y < e1 && H.slot_of[(size_t) y] < 0) ++y;
                 const size_t n = (size_t) (y - x) * L.stride;
                 if (dev)
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) (x - e0) * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
                                        n, cudaMemcpyDeviceToDevice, cst));
                 else
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.hblobs + (size_t) x * L.stride, n,
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) (x - e0) * L.stride, L.hblobs + (size_t) x * L.stride, n,
                                        cudaMemcpyHostToDevice, cst));
                 x = y;
             }
         }
+        // a short last part: the MMQ tail after its last expert is zero, as after a whole layer's (not an earlier part's experts)
+        if (e1 - e0 < np) CK(cudaMemsetAsync(stage[b] + (size_t) (e1 - e0) * L.stride, 0, kMmqTail, cst));
         CK(cudaEventRecord(ev_copy[b], cst));
     }
-    const uint8_t* stream_take(int li) {
-        if (stream_pos >= (int) stream_seq.size() || stream_seq[(size_t) stream_pos] != li) {
+    const uint8_t* stream_take(int li) {   // the next unit's buffer (layer li), once its copy is done
+        const int parts = stage_parts();
+        if (stream_pos >= (int) stream_seq.size() * parts || stream_seq[(size_t) (stream_pos / parts)] != li) {
             std::fprintf(stderr, "strata-q36: the expert stream is out of step (layer %d)\n", li);
             std::exit(1);
         }
@@ -2962,7 +3025,7 @@ struct Engine {
     void stream_done() {
         const int b = stream_pos % n_stage;
         CK(cudaEventRecord(ev_used[b], st));
-        if (stream_pos + n_stage < (int) stream_seq.size()) stream_kick(stream_pos + n_stage);
+        if (stream_pos + n_stage < (int) stream_seq.size() * stage_parts()) stream_kick(stream_pos + n_stage);
         ++stream_pos;
     }
 
@@ -3659,12 +3722,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     std::vector<Layer*> all;
     for (Layer& L : m.layers) all.push_back(&L);
     if (m.has_mtp) all.push_back(&m.mtp);
-    size_t total = 0, per_slot = 0, max_layer = 0;
+    size_t total = 0, per_slot = 0, max_layer = 0, max_stride = 0;
     for (Layer* L : all) {
         total += L->stride * (size_t) ne + kMmqTail;
         per_slot += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
+        max_stride = std::max(max_stride, L->stride);
     }
+    // one staging buffer: a whole layer's experts, or with STRATA_Q36_STAGE_SPLIT=N one part (ceil(ne / N) experts) of it
+    const size_t stage_layer = E.n_split > 1 ? max_stride * (size_t) E.stage_np() : max_layer;
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     // STRATA_Q36_RESERVE_MIB=N: the VRAM kept free beside the slots (default 768) - what cuBLAS, MMQ and the first prompt
@@ -3686,7 +3752,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // and CPU-output scratch, even with no expert slots. Keep the same reserve as the placement budget below.
     const size_t hybrid_scratch = (size_t) E.tmax * (size_t) m.top_k * ((size_t) g.n_embd + 1) * 4;
     const bool staging_short = E.use_mmq && total > budget &&
-                              (size_t) E.n_stage * (max_layer + kMmqTail) + hybrid_scratch + reserve > fr;
+                              (size_t) E.n_stage * (stage_layer + kMmqTail) + hybrid_scratch + reserve > fr;
     if (slots <= 0 && vram_gib < 0 && total > budget && packed_bytes > 0 &&
         (total <= budget + packed_bytes || (mtp_cpu_ok && main_need <= budget + packed_bytes + slack) || staging_short) &&
         std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr) {
@@ -3782,16 +3848,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // as STRATA_Q36_SINGLE_STAGE=1 (a layer's copy then waits for the one before to finish computing)
     if (kv_i8 && E.n_stage == 2 && E.use_mmq && E.main_hybrid) {
         const size_t att_save = E.kAttScoreFloats > ((size_t) 16 << 20) ? (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6 : 0;
-        const size_t pair = 2 * (max_layer + kMmqTail) + ecpu_bytes + hy_rows_max * (size_t) m.top_k * 4 + ((size_t) 512 << 20);
+        const size_t pair = 2 * (stage_layer + kMmqTail) + ecpu_bytes + hy_rows_max * (size_t) m.top_k * 4 + ((size_t) 512 << 20);
         if (pair > fr + att_save) {
             E.n_stage = 1;
             std::fprintf(stderr, "strata-q36: the prompt's staging pair (%.2f GiB) does not fit in the %.2f GiB free: one "
                          "staging buffer (%.2f GiB), as STRATA_Q36_SINGLE_STAGE=1\n",
-                         (double) (2 * (max_layer + kMmqTail)) / (1 << 30), (double) fr / (1 << 30),
-                         (double) (max_layer + kMmqTail) / (1 << 30));
+                         (double) (2 * (stage_layer + kMmqTail)) / (1 << 30), (double) fr / (1 << 30),
+                         (double) (stage_layer + kMmqTail) / (1 << 30));
         }
     }
-    const size_t staging = E.use_mmq && E.main_hybrid ? (size_t) E.n_stage * (max_layer + kMmqTail) : 0;
+    const size_t staging = E.use_mmq && E.main_hybrid ? (size_t) E.n_stage * (stage_layer + kMmqTail) : 0;
     // the streamed prompt path needs the staging buffer(s) plus E.ecpu (allocated below) to fit; where they only just
     // do not, shrink the attention scores buffer (256 -> 64 MB, the prompt attention then runs in more, smaller
     // slices) so the staging fits - the same trade the MTP-only path above makes.  (Opt-in only - --kv int8 or
@@ -3938,14 +4004,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         size_t f2 = 0, t2 = 0;
         CK(cudaMemGetInfo(&f2, &t2));
         std::fprintf(stderr, "strata-q36: staging alloc: n_stage=%d, max_layer=%.2f GiB (+%zu B), want=%.2f GiB, free=%.2f GiB\n",
-                     E.n_stage, (double) max_layer / (1 << 30), kMmqTail, (double) staging / (1 << 30),
+                     E.n_stage, (double) stage_layer / (1 << 30), kMmqTail, (double) staging / (1 << 30),
                      (double) f2 / (1 << 30));
+    }
+    if (staging && E.n_split > 1) {   // STRATA_Q36_STAGE_SPLIT: the parts, and whether their products equal a whole layer's bit for bit
+        const int np = E.stage_np();
+        bool whole = true;   // every tile's K sum in one block, for a part's launch and a whole layer's (MMQ::whole_tiles)
+        for (Layer* L : all)
+            whole = whole && MMQ::whole_tiles(L->L.gu_type, 2 * g.n_ff, np) && MMQ::whole_tiles(L->L.gu_type, 2 * g.n_ff, (int) ne) &&
+                    MMQ::whole_tiles(L->L.d_type, g.n_embd, np) && MMQ::whole_tiles(L->L.d_type, g.n_embd, (int) ne);
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_STAGE_SPLIT=%d: a streamed layer's experts in %d part(s) of up to %d (%.2f "
+                     "GiB per staging buffer, %d buffer(s)); outputs %s a whole-layer stage\n", E.n_split, E.stage_parts(), np,
+                     (double) (stage_layer + kMmqTail) / (1 << 30), E.n_stage,
+                     whole ? "bit-identical to" : "may differ in the last bits from");
     }
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < E.n_stage; ++b) {
-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+            CK(cudaMalloc(&E.stage[b], stage_layer + kMmqTail));
+            CK(cudaMemset(E.stage[b], 0, stage_layer + kMmqTail));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
