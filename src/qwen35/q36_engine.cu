@@ -1650,10 +1650,21 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
         const uint64_t nb = strata::tensor_payload_bytes(*t);
         uint8_t* d = nullptr;
-        CK(cudaMalloc(&d, nb));
-        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+        if (std::getenv("STRATA_Q36_EMBD_HOST") != nullptr && std::atoi(std::getenv("STRATA_Q36_EMBD_HOST")) != 0) {
+            // the table stays in pinned host memory: a token reads one row (2 KB) of it over PCIe, and the card keeps its
+            // 515 MiB for expert slots at a long context.  The device pointer is the mapped one (UVA: also the host's).
+            uint8_t* h = nullptr;
+            CK(cudaHostAlloc((void**) &h, nb, cudaHostAllocMapped));
+            std::memcpy(h, gm.shard(s).tensor_data(*t), nb);
+            CK(cudaHostGetDevicePointer((void**) &d, h, 0));
+            std::fprintf(stderr, "strata-q36: the token embedding table (%.0f MiB) stays in host memory "
+                         "(STRATA_Q36_EMBD_HOST=1)\n", (double) nb / (1 << 20));
+        } else {
+            CK(cudaMalloc(&d, nb));
+            CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+            bytes += nb;
+        }
         m.embd = d;
-        bytes += nb;
     }
     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
@@ -3656,7 +3667,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
+    // STRATA_Q36_RESERVE_MIB=N: the VRAM kept free beside the slots (default 768) - what cuBLAS, MMQ and the first prompt
+    // allocate later; a long-context 8 GB card trades it for expert slots (a decode token reads more experts from VRAM)
+    const size_t reserve = (std::getenv("STRATA_Q36_RESERVE_MIB") ? (size_t) std::atoll(std::getenv("STRATA_Q36_RESERVE_MIB")) : (size_t) 768) << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
