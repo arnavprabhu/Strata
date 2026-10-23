@@ -108,6 +108,35 @@ __device__ float block_max(float v, float* sh) {
     __syncthreads();
     return r;
 }
+/// The orthonormal Walsh-Hadamard transform of 256 values, one per thread of a 256-thread block (sh: 256 floats): the
+/// 5 low index bits by shuffles, the 3 high ones through shared memory, times 1 / 16.  Its own inverse.  Every thread of
+/// the block calls it.
+__device__ float fwht256_block(float v, float* sh) {
+    const int i = threadIdx.x;
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        const float o = __shfl_xor_sync(0xffffffffu, v, h, 32);
+        v = (i & h) ? o - v : v + o;
+    }
+    __syncthreads();   // (sh may still be read by the caller's earlier round)
+    sh[i] = v;
+    __syncthreads();
+#pragma unroll
+    for (int h = 32; h < 256; h <<= 1) {
+        const float o = sh[i ^ h];
+        __syncthreads();
+        v = (i & h) ? o - v : v + o;
+        sh[i] = v;
+        __syncthreads();
+    }
+    return v * 0.0625f;
+}
+/// x[r] = H x[r] for rows of 256 floats (the V rotation of --kv k8v4 undone on the prompt attention's output). grid (rows), block 256.
+__global__ void k_fwht256_rows(float* x) {
+    __shared__ float sh[256];
+    float* r = x + (size_t) blockIdx.x * 256;
+    r[threadIdx.x] = fwht256_block(r[threadIdx.x], sh);
+}
 
 /// y[r] = rms(x[r]) * w, one block per row of n.
 __global__ void k_rms(const float* x, const float* w, float* y, int n, float eps) {
@@ -246,6 +275,8 @@ struct RowSel {
     const int32_t* delta = nullptr;  // device [T]
     float* const* kc = nullptr;      // device [n_sessions]: this layer's K / V base of each session
     float* const* vc = nullptr;
+    int rot = 0;                     // --kv k8v4 with the Hadamard rotation: the V cells are stored rotated (k_attn_prep
+                                     // rotates them, the merges rotate the attention output back); any other store: 0
 };
 
 /// The KV cache's int8 mode (--kv int8 / STRATA_Q36_KV=int8): kKVG values share one FP16 scale (the group's absmax /
@@ -261,6 +292,27 @@ template <class P> __host__ __device__ inline auto kv8_scales(P* base, int HKV, 
     return reinterpret_cast<H*>(reinterpret_cast<B*>(base) + kv8_codes(HKV, ctx, HD));
 }
 
+/// The V store of --kv k8v4: 4-bit codes, kKVG4 values to one FP16 scale d (ggml's Q4_0: d = the group's value of largest
+/// magnitude / -8, code = clamp(floor(x / d + 8.5), 0, 15), value = (code - 8) d, so that value is exact), a cell
+/// 1/2 + 2 / kKVG4 bytes per value (int8's is 1 + 2 / kKVG).  Also ONE allocation: [kvh][ctx][HD / 2] bytes of codes (value 2 b
+/// in the low nibble of byte b, 2 b + 1 in the high one), then [kvh][ctx][HD / kKVG4] FP16 scales.  HD == 256.  With the
+/// rotation (RowSel::rot, on by default) the cell holds H v, H the orthonormal Walsh-Hadamard matrix of 256 (as the
+/// other KV path of this repo does for Qwen3.8), which spreads a cell's outlier channels over its groups; sum_k p_k (H v_k) =
+/// H sum_k p_k v_k, so the attention output is rotated back once per row (H is its own inverse).
+constexpr int kKVG4 = 32;
+__host__ __device__ inline size_t kv4_codes(int HKV, int ctx, int HD) { return (size_t) HKV * ctx * (HD / 2); }
+template <class P> __host__ __device__ inline auto kv4_scales(P* base, int HKV, int ctx, int HD) {
+    using H = std::conditional_t<std::is_const_v<P>, const __half, __half>;
+    using B = std::conditional_t<std::is_const_v<P>, const uint8_t, uint8_t>;
+    return reinterpret_cast<H*>(reinterpret_cast<B*>(base) + kv4_codes(HKV, ctx, HD));
+}
+/// The low 16 bits of h (4 nibbles, the first value in the lowest) as 4 int8 codes in a word: each nibble n becomes
+/// the byte n - 8 (so the int8 paths' i8x4_f32 / i8x2_h2 read them)
+__host__ __device__ inline uint32_t nib4_i8x4(uint32_t h) {
+    const uint32_t w = (h & 0x000Fu) | ((h & 0x00F0u) << 4) | ((h & 0x0F00u) << 8) | ((h & 0xF000u) << 12);   // n in each byte
+    return ((w | 0x80808080u) - 0x08080808u) ^ 0x80808080u;   // (128 + n) - 8, then - 128: the byte n - 8
+}
+
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
 /// RMS-normed per head with their weights, NEOX RoPE over the first n_rot dims, k / v into the cache, the gate kept.
 /// Rotary position of a cell: the cell itself (text) plus *rdelta (what the pictures before a text run did not use
@@ -268,8 +320,9 @@ template <class P> __host__ __device__ inline auto kv8_scales(P* base, int HKV, 
 /// interleaved M-RoPE position (llama.cpp's IMROPE with sections 11 / 11 / 10: pair p takes stream p % 3).
 /// grid (H + HKV, T), block 256 (HD <= 256).  KI8 / VI8 (--kv): the K / V cells as kKVG-value groups of int8 codes and
 /// one FP16 scale (see kKVG for the store's layout); <false, false> is the FP32 kernel as before.  The stores are
-/// independent: --kv k8v32 runs KI8 with a FP32 V.
-template <bool KI8, bool VI8>
+/// independent: --kv k8v32 runs KI8 with a FP32 V.  V4 (--kv k8v4, VI8 too): the V cells as kKVG4-value groups of 4-bit
+/// codes (see kKVG4), rotated first when rs.rot.
+template <bool KI8, bool VI8, bool V4 = false>
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
                             float* q, float* gate, float* kc, float* vc, int H, int HKV, int HD, int n_rot,
                             const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
@@ -325,7 +378,23 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         } else {
             kc[((size_t) kh * ctx + pos) * HD + i] = v;
         }
-        if constexpr (VI8) {
+        if constexpr (V4) {   // 32 values (one warp) per scale: d = the value of largest magnitude / -8, Q4_0's codes
+            float vi = vx[((size_t) t * HKV + kh) * HD + i];
+            if (rs.rot) vi = fwht256_block(vi, sh);
+            float am = fabsf(vi), mv = vi;   // (the pair (|x|, x) in lexicographic order: every lane ends with the same one)
+            for (int m = 16; m > 0; m >>= 1) {
+                const float a2 = __shfl_xor_sync(0xffffffffu, am, m, 32), v2 = __shfl_xor_sync(0xffffffffu, mv, m, 32);
+                if (a2 > am || (a2 == am && v2 > mv)) am = a2, mv = v2;
+            }
+            const __half dh = __float2half(mv != 0.f ? mv / -8.0f : 1.0f);
+            const float d = __half2float(dh) != 0.f ? __half2float(dh) : 1.0f;   // (a group below FP16's range: all codes 8)
+            const int q = (int) fminf(fmaxf(floorf(vi / d + 8.5f), 0.0f), 15.0f);
+            const int qn = __shfl_down_sync(0xffffffffu, q, 1, 32);
+            uint8_t* vp = ((uint8_t*) vc) + ((size_t) kh * ctx + pos) * (HD / 2);
+            __half* vsp = kv4_scales(vc, HKV, ctx, HD) + ((size_t) kh * ctx + pos) * (HD / kKVG4);
+            if ((i & 1) == 0) vp[i >> 1] = (uint8_t) (q | (qn << 4));
+            if ((i & 31) == 0) vsp[i >> 5] = __float2half(d);
+        } else if constexpr (VI8) {
             const int NG = HD / kKVG;
             int8_t* vp = ((int8_t*) vc) + ((size_t) kh * ctx + pos) * HD;
             __half* vsp = kv8_scales(vc, HKV, ctx, HD) + ((size_t) kh * ctx + pos) * NG;
@@ -350,13 +419,14 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
 /// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.  KI8 / VI8 (--kv): the K / V
 /// cells dequantized with their group's FP16 scale on the fly (see kKVG for the store's layout).  The int8 reads are
 /// vectorized (one uint2 per 8 K codes, one scale per kKVG group) and the V weights are pre-multiplied into shared
-/// memory once per block.  <false, false> is the FP32 kernel as before.
-template <bool KI8, bool VI8>
+/// memory once per block.  <false, false> is the FP32 kernel as before.  V4 (--kv k8v4): the V cells' 4-bit codes, 32 values
+/// to a scale (see kKVG4).
+template <bool KI8, bool VI8, bool V4 = false>
 __global__ void k_attn_part(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
                             int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
-    __shared__ float wv[VI8 ? HD / kKVG : 1][VI8 ? kChunkCells : 1];   // VI8: sc[k] * the V group's scale, once per block
+    __shared__ float wv[VI8 ? HD / (V4 ? kKVG4 : kKVG) : 1][VI8 ? kChunkCells : 1];   // VI8: sc[k] * the V group's scale, once per block
     const int c = blockIdx.x, row = blockIdx.y;
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
@@ -396,7 +466,20 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
     float acc = 0.f;
-    if constexpr (VI8) {
+    if constexpr (V4) {
+        constexpr int NV = HD / kKVG4;
+        const uint8_t* vp = ((const uint8_t*) vc) + ((size_t) kvh * ctx + p0) * (HD / 2) + (j >> 1);
+        const __half* vsp = kv4_scales(vc, HKV, ctx, HD) + ((size_t) kvh * ctx + p0) * NV;
+        __syncthreads();   // sc[] is complete; the weight table takes its per-cell values now
+        for (int x = j; x < NV * n; x += kThreads) {
+            const int g = x / n, k = x - g * n;
+            wv[g][k] = sc[k] * __half2float(vsp[(size_t) k * NV + g]);
+        }
+        __syncthreads();
+        const float* wr = wv[j / kKVG4];
+        const int sh4 = (j & 1) * 4;
+        for (int k = 0; k < n; ++k) acc = fmaf(wr[k], (float) ((int) ((vp[(size_t) k * (HD / 2)] >> sh4) & 15) - 8), acc);
+    } else if constexpr (VI8) {
         const int8_t* vp = ((const int8_t*) vc) + ((size_t) kvh * ctx + p0) * HD;
         const __half* vsp = kv8_scales(vc, HKV, ctx, HD) + ((size_t) kvh * ctx + p0) * (HD / kKVG);
         __syncthreads();   // sc[] is complete; the weight table takes its per-cell values now
@@ -423,6 +506,7 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
                              const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs) {
     constexpr int HD = 256;
+    __shared__ float sh[HD];   // (rs.rot: the rotation of the V cells undone, see kKVG4)
     const int row = blockIdx.x, t = t0 + row / H, h = row % H, d = threadIdx.x;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     const int nc = (npos + kChunkCells - 1) / kChunkCells;
@@ -436,7 +520,9 @@ __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl
         den += w * pl[o];
     }
     const size_t gi = ((size_t) t * H + h) * HD + d;
-    out[gi] = num / den * sigm(gate[gi]);
+    float o = num / den;
+    if (rs.rot) o = fwht256_block(o, sh);
+    out[gi] = o * sigm(gate[gi]);
 }
 
 /// 4 int8 codes (one 32-bit word) as 4 floats, exactly: each byte + 128 in the low mantissa bits of 2^23, minus
@@ -507,20 +593,23 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], u
 ///   heads' 8 partial sums added across the warp in one transposed butterfly (9 shuffles for the 8 sums), kGqaCpw
 ///   cells at a time per warp.  P . V: 64 threads per cell, 4 values each (one float4 / one word of codes), 4 cells
 ///   side by side, all heads' sums in registers, the 4 cell groups added in shared memory at the end.
+///   V4 (--kv k8v4, see kKVG4): the V cells' 4-bit codes widened to int8 codes in registers (nib4_i8x4), and the scale
+///   groups are 32 values: warp w's own values, so P . V takes one group's (signed) scale per warp.
 constexpr int kGqaG = 8, kGqaTile = 256, kGqaCpw = 2;
-template <bool KI8, bool VI8>
+template <bool KI8, bool VI8, bool V4 = false>
 __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const float* kc, const float* vc, const int32_t* pos0,
                                                        int t0, int H, int HKV, int ctx, float scale, int n_chunk, int cc,
                                                        float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256, G = kGqaG, TL = kGqaTile, NG = HD / kKVG;
+    constexpr int NV = V4 ? HD / kKVG4 : NG;   // the V scale groups of a cell
     [[maybe_unused]] constexpr bool MK = STRATA_Q36_GQA_MMA && KI8, MV = STRATA_Q36_GQA_MMA && VI8;   // Q . K / P . V on the tensor cores
     constexpr int LS = TL + 16;   // MV: a head's row of weights (padded: the B loads' 8 heads in distinct banks)
     // the tile's scores, then its weights exp(s - m): MV head-major [G][LS], else cell-major [TL][G]
     __shared__ __align__(16) float spb[MV ? G * LS : TL * G];
     __shared__ __align__(16) float qs[G * HD];                           // the queries (MK: their B fragments)
     __shared__ __align__(16) float red[MV ? 1 : 2][G][MV ? 4 : HD];      // !MV: the cell groups' sums added
-    __shared__ __align__(16) float svs[MV ? NG : 1][MV ? TL : 4];       // MV: the cells' V scales times 2^E
-    __shared__ float smx[kThreads / 32][NG];                             // MV: each warp's largest V scale per group
+    __shared__ __align__(16) float svs[MV ? NV : 1][MV ? TL : 4];       // MV: the cells' V scales times 2^E
+    __shared__ float smx[kThreads / 32][NV];                             // MV: each warp's largest V scale per group (V4: magnitude)
     __shared__ float mh[G], lh[G], ah[G];
     auto S = [&](int k, int h) -> float& { return MV ? spb[h * LS + k] : spb[k * G + h]; };
     const int tr = blockIdx.x, kvh = blockIdx.y, c = blockIdx.z;
@@ -564,8 +653,13 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
     const size_t cb = (size_t) kvh * ctx;   // the KV head's first cell
     for (int tp = p0; tp < pend; tp += TL) {
         const int n = min(TL, pend - tp), n16 = (n + 15) & ~15;
-        float sv[NG];   // MV: thread j's cell's V scales
-        if constexpr (MV) {
+        float sv[NV];   // MV: thread j's cell's V scales
+        if constexpr (MV && V4) {
+            const uint4 r = j < n ? *reinterpret_cast<const uint4*>(kv4_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NV) : make_uint4(0, 0, 0, 0);
+            const __half* h8 = reinterpret_cast<const __half*>(&r);
+#pragma unroll
+            for (int gb = 0; gb < NV; ++gb) sv[gb] = __half2float(h8[gb]);
+        } else if constexpr (MV) {
             const uint2 r = j < n ? *reinterpret_cast<const uint2*>(kv8_scales(vc, HKV, ctx, HD) + (cb + tp + j) * NG) : make_uint2(0, 0);
             const __half* h4 = reinterpret_cast<const __half*>(&r);
 #pragma unroll
@@ -674,8 +768,8 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
         }
         if constexpr (MV) {   // each warp's largest V scale per group
 #pragma unroll
-            for (int gb = 0; gb < NG; ++gb) {
-                float mv = sv[gb];
+            for (int gb = 0; gb < NV; ++gb) {
+                float mv = V4 ? fabsf(sv[gb]) : sv[gb];   // (V4: the scales are signed)
                 for (int o = 16; o > 0; o >>= 1) mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, o, 32));
                 if (lane == 0) smx[w][gb] = mv;
             }
@@ -695,7 +789,7 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
             for (int o = 16; o > 0; o >>= 1) su += __shfl_xor_sync(0xffffffffu, su, o, 32);
             if constexpr (MV) {   // thread j's cell's V scales times its group's 2^E
 #pragma unroll
-                for (int gb = 0; gb < NG; ++gb) {
+                for (int gb = 0; gb < NV; ++gb) {
                     float mv = smx[0][gb];
                     for (int x = 1; x < kThreads / 32; ++x) mv = fmaxf(mv, smx[x][gb]);
                     int ex;
@@ -714,19 +808,24 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
         __syncthreads();
 #if STRATA_Q36_GQA_MMA
         if constexpr (MV) {
-            const int gw = w >> 1;   // the warp's scale group
+            const int gw = V4 ? w : w >> 1;   // the warp's scale group
             float mv = smx[0][gw];
             for (int x = 1; x < kThreads / 32; ++x) mv = fmaxf(mv, smx[x][gw]);
             int ex;
             frexpf(mv, &ex);
             const float inv = ldexpf(1.f, ex - 14);
             float e[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
-            const int8_t* vb = ((const int8_t*) vc) + (cb + tp) * HD + 32 * w + 4 * g;
+            const int8_t* vb = ((const int8_t*) vc) + (cb + tp) * (V4 ? HD / 2 : HD) + (V4 ? 16 * w + 2 * g : 32 * w + 4 * g);
             for (int k0 = 0; k0 < n; k0 += 16) {
                 const int kq = k0 + 4 * tq;   // the lane's cells kq .. + 3
                 uint32_t x[4];
 #pragma unroll
-                for (int i = 0; i < 4; ++i) x[i] = kq + i < n ? *reinterpret_cast<const uint32_t*>(vb + (size_t) (kq + i) * HD) : 0u;
+                for (int i = 0; i < 4; ++i) {
+                    if constexpr (V4)   // the lane's 4 values: 2 bytes of 4-bit codes
+                        x[i] = kq + i < n ? nib4_i8x4(*reinterpret_cast<const unsigned short*>(vb + (size_t) (kq + i) * (HD / 2))) : 0u;
+                    else
+                        x[i] = kq + i < n ? *reinterpret_cast<const uint32_t*>(vb + (size_t) (kq + i) * HD) : 0u;
+                }
                 const float4 pw = *reinterpret_cast<const float4*>(&spb[g * LS + kq]);
                 const float4 ps = *reinterpret_cast<const float4*>(&svs[gw][kq]);
                 uint32_t bh0, bl0, bh1, bl1;
@@ -762,7 +861,11 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
             for (int k = vg; k < n; k += 4) {
                 const size_t p = cb + tp + k;
                 float v[4];
-                if constexpr (VI8) {
+                if constexpr (V4) {
+                    i8x4_f32(nib4_i8x4(*reinterpret_cast<const unsigned short*>(((const uint8_t*) vc) + p * (HD / 2) + d0 / 2)), v);
+                    const float sg = __half2float(kv4_scales(vc, HKV, ctx, HD)[p * NV + d0 / kKVG4]);
+                    v[0] *= sg, v[1] *= sg, v[2] *= sg, v[3] *= sg;
+                } else if constexpr (VI8) {
                     i8x4_f32(*reinterpret_cast<const uint32_t*>(((const int8_t*) vc) + p * HD + d0), v);
                     const float sg = __half2float(kv8_scales(vc, HKV, ctx, HD)[p * NG + d0 / kKVG]);
                     v[0] *= sg, v[1] *= sg, v[2] *= sg, v[3] *= sg;
@@ -821,6 +924,7 @@ __global__ void __launch_bounds__(kThreads, 2) k_attn_gqa(const float* q, const 
 __global__ void k_attn_merge_cc(const float* pacc, const float* pm, const float* pl, const float* gate,
                                 const int32_t* pos0, int t0, int H, int n_chunk, int cc, float* out, RowSel rs) {
     constexpr int HD = 256;
+    __shared__ float sh[HD];   // (rs.rot: the rotation of the V cells undone, see kKVG4)
     const int row = blockIdx.x, t = t0 + row / H, h = row % H, d = threadIdx.x;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     const int nc = (npos + cc - 1) / cc;
@@ -834,7 +938,9 @@ __global__ void k_attn_merge_cc(const float* pacc, const float* pm, const float*
         den += w * pl[o];
     }
     const size_t gi = ((size_t) t * H + h) * HD + d;
-    out[gi] = num / den * sigm(gate[gi]);
+    float o = num / den;
+    if (rs.rot) o = fwht256_block(o, sh);
+    out[gi] = o * sigm(gate[gi]);
 }
 
 /// The routed entries (T tokens x K picks, entry e = t * K + k) grouped per expert, on the device: one group per
@@ -905,8 +1011,9 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
 }
 /// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
 /// [kvh][P][HD] halves.  grid1(HKV * P * HD).  KI8 / VI8 (--kv): the codes dequantized with their group's FP16 scale
-/// (see kKVG); <false, false> is the FP32 kernel as before.
-template <bool KI8, bool VI8>
+/// (see kKVG); <false, false> is the FP32 kernel as before.  V4 (--kv k8v4): the V cells' 4-bit codes (see kKVG4; a rotated
+/// store gives the rotated cells: the caller undoes that on the attention output).
+template <bool KI8, bool VI8, bool V4 = false>
 __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int P, int HD, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) HKV * P * HD) return;
@@ -918,7 +1025,11 @@ __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* 
         const size_t si = (size_t) kvh * ctx * (HD / kKVG) + (size_t) p * (HD / kKVG) + d / kKVG;
         if constexpr (KI8) k16[i] = __float2half(__half2float(kv8_scales(kc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) kc)[src]);
         else k16[i] = __float2half(kc[src]);
-        if constexpr (VI8) v16[i] = __float2half(__half2float(kv8_scales(vc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) vc)[src]);
+        if constexpr (V4) {
+            const size_t vcell = (size_t) kvh * ctx + p;
+            const int nib = (((const uint8_t*) vc)[vcell * (HD / 2) + d / 2] >> ((d & 1) * 4)) & 15;
+            v16[i] = __float2half(__half2float(kv4_scales(vc, HKV, ctx, HD)[vcell * (HD / kKVG4) + d / kKVG4]) * (float) (nib - 8));
+        } else if constexpr (VI8) v16[i] = __float2half(__half2float(kv8_scales(vc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) vc)[src]);
         else v16[i] = __float2half(vc[src]);
     } else {
         k16[i] = __float2half(kc[src]);
@@ -952,7 +1063,7 @@ __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
 // and sum, here between cuBLAS GEMMs)
 /// k_kv_f16 for cells [c0, c0 + n) of each KV head into compact [kvh][n][HD] halves (the same rounding; KI8 / VI8: the
 /// codes dequantized with their group's FP16 scale, see kKVG).  grid1(HKV * n * HD).
-template <bool KI8, bool VI8>
+template <bool KI8, bool VI8, bool V4 = false>
 __global__ void k_kv_f16_blk(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int c0, int n, int HD,
                              int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -964,7 +1075,11 @@ __global__ void k_kv_f16_blk(const float* kc, const float* vc, __half* k16, __ha
     const size_t si = ((size_t) kvh * ctx + p) * (HD / kKVG) + d / kKVG;
     if constexpr (KI8) k16[i] = __float2half(__half2float(kv8_scales(kc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) kc)[src]);
     else k16[i] = __float2half(kc[src]);
-    if constexpr (VI8) v16[i] = __float2half(__half2float(kv8_scales(vc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) vc)[src]);
+    if constexpr (V4) {
+        const size_t vcell = (size_t) kvh * ctx + p;
+        const int nib = (((const uint8_t*) vc)[vcell * (HD / 2) + d / 2] >> ((d & 1) * 4)) & 15;
+        v16[i] = __float2half(__half2float(kv4_scales(vc, HKV, ctx, HD)[vcell * (HD / kKVG4) + d / kKVG4]) * (float) (nib - 8));
+    } else if constexpr (VI8) v16[i] = __float2half(__half2float(kv8_scales(vc, HKV, ctx, HD)[si]) * (float) ((const int8_t*) vc)[src]);
     else v16[i] = __float2half(vc[src]);
 }
 /// One block of cells [c0, c0 + n) of the online causal softmax: row (h, t) of S (ld floats) -> FP16 exp(S * scale - M)
@@ -1788,18 +1903,30 @@ struct Engine {
     // per store, see kKVG; the pointers in kc / vc and the sessions' tables are that allocation's base).  kv_k8 / kv_v8
     // are independent (--kv k8v32 keeps a FP32 V next to the int8 K); decode and prompt attention dequantize on the fly.
     bool kv_k8 = false, kv_v8 = false;
-    /// One K / V store's allocation in floats (dalloc's unit): FP32 cells, or int8 codes + FP16 scales.
-    size_t kv_store_floats(bool i8) const {
+    // --kv k8v4 (kv_k8 and kv_v8 are set too, so everything an int8 store changes applies): the V store as 4-bit codes with
+    // an FP16 scale per kKVG4 values (see kKVG4); kv_v4_rot: the V cells stored Hadamard-rotated (STRATA_Q36_V4_ROT=0: not)
+    bool kv_v4 = false, kv_v4_rot = true;
+    /// One K / V store's allocation in floats (dalloc's unit): FP32 cells, or int8 codes + FP16 scales, or (i4: the V of
+    /// --kv k8v4) 4-bit codes + FP16 scales.
+    size_t kv_store_floats(bool i8, bool i4 = false) const {
         const size_t cells = (size_t) m->g.n_head_kv * ctx * m->g.head_dim;
+        if (i4) return (cells / 2 + cells / kKVG4 * 2 + 3) / 4;
         return i8 ? (cells + cells / kKVG * 2 + 3) / 4 : cells;
     }
-    /// the four K / V store combinations (--kv): f(kv_ic<K8>{}, kv_ic<V8>{}) runs with the kernel's template arguments
+    /// the K / V store combinations (--kv): f(kv_ic<K8>{}, kv_ic<V8>{}, kv_ic<V4>{}) runs with the kernel's template arguments
+    /// (V4 only with both set: --kv k8v4)
     template <bool B> struct kv_ic { static constexpr bool value = B; };
     template <class F> void kv4(F&& f) const {
-        if (kv_k8 && kv_v8) f(kv_ic<true>{}, kv_ic<true>{});
-        else if (kv_k8) f(kv_ic<true>{}, kv_ic<false>{});
-        else if (kv_v8) f(kv_ic<false>{}, kv_ic<true>{});
-        else f(kv_ic<false>{}, kv_ic<false>{});
+        if (kv_k8 && kv_v8 && kv_v4) f(kv_ic<true>{}, kv_ic<true>{}, kv_ic<true>{});
+        else if (kv_k8 && kv_v8) f(kv_ic<true>{}, kv_ic<true>{}, kv_ic<false>{});
+        else if (kv_k8) f(kv_ic<true>{}, kv_ic<false>{}, kv_ic<false>{});
+        else if (kv_v8) f(kv_ic<false>{}, kv_ic<true>{}, kv_ic<false>{});
+        else f(kv_ic<false>{}, kv_ic<false>{}, kv_ic<false>{});
+    }
+    /// the codes and the scales of one (cell, KV head) of a K / V store, in bytes: FP32 / int8 / 4-bit (i4: the V of k8v4)
+    size_t kv_cell_codes(bool i8, bool i4 = false) const { return (size_t) m->g.head_dim * (i4 ? 1 : i8 ? 2 : 8) / 2; }
+    size_t kv_cell_scales(bool i8, bool i4 = false) const {
+        return i4 ? m->g.head_dim / kKVG4 * 2 : i8 ? m->g.head_dim / kKVG * 2 : 0;
     }
 
     // ---- sessions: the conversation states.  One for a single-request engine; --batch N keeps N, each with its own
@@ -1919,7 +2046,7 @@ struct Engine {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
                 ss.kc.push_back(dalloc(kv_store_floats(kv_k8)));
-                ss.vc.push_back(dalloc(kv_store_floats(kv_v8)));
+                ss.vc.push_back(dalloc(kv_store_floats(kv_v8, kv_v4)));
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
@@ -1931,7 +2058,7 @@ struct Engine {
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
             ss.kc.push_back(dalloc(kv_store_floats(kv_k8)));
-            ss.vc.push_back(dalloc(kv_store_floats(kv_v8)));
+            ss.vc.push_back(dalloc(kv_store_floats(kv_v8, kv_v4)));
         }
         ss.hlast = dalloc((size_t) g.n_embd);
     }
@@ -1970,7 +2097,12 @@ struct Engine {
         if ((kv_k8 || kv_v8) && (int) m->g.head_dim % kKVG != 0) {
             std::fprintf(stderr, "strata-q36: head_dim %d is not a multiple of %d: the KV cache stays FP32\n",
                          (int) m->g.head_dim, kKVG);
-            kv_k8 = kv_v8 = false;
+            kv_k8 = kv_v8 = kv_v4 = false;
+        }
+        if (kv_v4 && (int) m->g.head_dim != 256) {   // the V4 kernels (the rotation, the warp-sized groups) are written for 256
+            std::fprintf(stderr, "strata-q36: --kv k8v4 needs head_dim 256 (this model: %d): the V cache stays int8\n",
+                         (int) m->g.head_dim);
+            kv_v4 = false;
         }
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
@@ -2110,7 +2242,7 @@ struct Engine {
             // the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-            const size_t per = (kv_store_floats(kv_k8) + kv_store_floats(kv_v8)) * 4 * n_attn +
+            const size_t per = (kv_store_floats(kv_k8) + kv_store_floats(kv_v8, kv_v4)) * 4 * n_attn +
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
             size_t fr0 = 0, tot0 = 0;
             CK(cudaMemGetInfo(&fr0, &tot0));
@@ -2628,9 +2760,10 @@ struct Engine {
                 rs.kc = d_kc_tab + li * n_sess;
                 rs.vc = d_vc_tab + li * n_sess;
             }
-            kv4([&](auto k8c, auto v8c) {
-                constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
-                k_attn_prep<K8, V8><<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
+            rs.rot = kv_v4 && kv_v4_rot;
+            kv4([&](auto k8c, auto v8c, auto v4c) {
+                constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
+                k_attn_prep<K8, V8, V4><<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
                                                                           rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
                                                                           m->rope_base, m->eps, d_delta, mtab_now, rs);
             });
@@ -2652,9 +2785,9 @@ struct Engine {
                     k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                     for (int c0 = 0; c0 < P; c0 += kv16_blk) {
                         const int nb = std::min(kv16_blk, P - c0);
-                        kv4([&](auto k8c, auto v8c) {
-                            constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
-                            k_kv_f16_blk<K8, V8><<<grid1((int64_t) HKV * nb * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16,
+                        kv4([&](auto k8c, auto v8c, auto v4c) {
+                            constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
+                            k_kv_f16_blk<K8, V8, V4><<<grid1((int64_t) HKV * nb * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16,
                                                                                                     ctx, c0, nb, HD, HKV);
                         });
                         for (int t0 = 0; t0 < T; t0 += tqb) {
@@ -2688,11 +2821,12 @@ struct Engine {
                             }
                         }
                     }
+                    if (rs.rot) k_fwht256_rows<<<(unsigned) ((int64_t) T * H), 256, 0, st>>>(att);   // (k8v4: out = H (P V~) before 1 / l and the gate)
                     k_gate_mul_l<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, att_l, HD, (int64_t) T * H * HD);
                 } else {
-                kv4([&](auto k8c, auto v8c) {
-                    constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
-                    k_kv_f16<K8, V8><<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
+                kv4([&](auto k8c, auto v8c, auto v4c) {
+                    constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
+                    k_kv_f16<K8, V8, V4><<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
                 });
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
@@ -2724,6 +2858,7 @@ struct Engine {
                         }
                     }
                 }
+                if (rs.rot) k_fwht256_rows<<<(unsigned) ((int64_t) T * H), 256, 0, st>>>(att);   // (k8v4: out = H (P V~) before the gate)
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
                 }
             } else {
@@ -2736,9 +2871,9 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int ncg = (ctx + gqa_cc - 1) / gqa_cc;   // <= n_chunk: the partials keep their row stride
                     const int nc = graph_mode ? ncg : (int) std::min<int64_t>(ncg, (p0 + t0 + nt + gqa_cc - 1) / gqa_cc);
-                    kv4([&](auto k8c, auto v8c) {
-                        constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
-                        k_attn_gqa<K8, V8><<<dim3(nt, HKV, nc), kThreads, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                    kv4([&](auto k8c, auto v8c, auto v4c) {
+                        constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
+                        k_attn_gqa<K8, V8, V4><<<dim3(nt, HKV, nc), kThreads, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                                                                                   rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
                                                                                   1.0f / sqrtf((float) HD), n_chunk, gqa_cc, pacc, pm,
                                                                                   pl, rs);
@@ -2749,9 +2884,9 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    kv4([&](auto k8c, auto v8c) {
-                        constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
-                        k_attn_part<K8, V8><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                    kv4([&](auto k8c, auto v8c, auto v4c) {
+                        constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value, V4 = decltype(v4c)::value;
+                        k_attn_part<K8, V8, V4><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                                                                                      rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
                                                                                      1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
                     });
@@ -3479,21 +3614,22 @@ struct Engine {
                                      cudaMemcpyDeviceToDevice, st));
             } else if (a.kc[l] && a.pos > 0) {   // --kv: an int8 store's first pos cells are its codes' and its scales'
                 const int HKV_ = (int) g.n_head_kv, HD_ = (int) g.head_dim;
-                auto cp = [&](float* d, const float* s_, bool i8) {
+                auto cp = [&](float* d, const float* s_, bool i8, bool i4) {
                     if (!i8) {
                         CK(cudaMemcpy2DAsync(d, row, s_, row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
                                              cudaMemcpyDeviceToDevice, st));
                         return;
                     }
-                    const size_t ng = (size_t) HD_ / kKVG;
-                    CK(cudaMemcpy2DAsync(d, (size_t) ctx * HD_, s_, (size_t) ctx * HD_, (size_t) a.pos * HD_, (size_t) HKV_,
+                    const size_t cb = kv_cell_codes(true, i4), sb = kv_cell_scales(true, i4);   // bytes per cell of a KV head
+                    CK(cudaMemcpy2DAsync(d, (size_t) ctx * cb, s_, (size_t) ctx * cb, (size_t) a.pos * cb, (size_t) HKV_,
                                          cudaMemcpyDeviceToDevice, st));
-                    CK(cudaMemcpy2DAsync(kv8_scales(d, HKV_, ctx, HD_), (size_t) ctx * ng * 2, kv8_scales(s_, HKV_, ctx, HD_),
-                                         (size_t) ctx * ng * 2, (size_t) a.pos * ng * 2, (size_t) HKV_,
+                    auto* ds = i4 ? (void*) kv4_scales(d, HKV_, ctx, HD_) : (void*) kv8_scales(d, HKV_, ctx, HD_);
+                    const auto* ss_ = i4 ? (const void*) kv4_scales(s_, HKV_, ctx, HD_) : (const void*) kv8_scales(s_, HKV_, ctx, HD_);
+                    CK(cudaMemcpy2DAsync(ds, (size_t) ctx * sb, ss_, (size_t) ctx * sb, (size_t) a.pos * sb, (size_t) HKV_,
                                          cudaMemcpyDeviceToDevice, st));
                 };
-                cp(b.kc[l], a.kc[l], kv_k8);
-                cp(b.vc[l], a.vc[l], kv_v8);
+                cp(b.kc[l], a.kc[l], kv_k8, false);
+                cp(b.vc[l], a.vc[l], kv_v8, kv_v4);
             }
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
@@ -3549,33 +3685,34 @@ struct Engine {
     // with a host row pitch of `cap` cells, so a restore can bring back any n <= cap of them.
     /// Host bytes of `cells` cells of all the K / V stores.
     size_t kv_cells_bytes(int64_t cells) const {
-        const size_t HKV = (size_t) m->g.n_head_kv, HD = (size_t) m->g.head_dim, ng = HD / kKVG;
-        auto one = [&](bool i8) { return i8 ? HKV * (HD + ng * 2) : HKV * HD * 4; };
+        const size_t HKV = (size_t) m->g.n_head_kv;
+        auto one = [&](bool i8, bool i4) { return HKV * (kv_cell_codes(i8, i4) + kv_cell_scales(i8, i4)); };
         size_t per = 0;
-        for (float* k : kc) per += k ? one(kv_k8) + one(kv_v8) : 0;
+        for (float* k : kc) per += k ? one(kv_k8, false) + one(kv_v8, kv_v4) : 0;
         return per * (size_t) cells;
     }
     /// The current session's cells [0, n) to (save) or from a parked image of `cap` cells at `host`.
     void kv_copy(char* host, int64_t cap, int64_t n, bool save) {
         if (n <= 0) return;
         const int HKV = (int) m->g.n_head_kv, HD = (int) m->g.head_dim;
-        const size_t ng = (size_t) HD / kKVG;
         char* h = host;
         auto cp2 = [&](void* d, size_t dpitch, size_t hpitch, size_t width) {
             if (save) CK(cudaMemcpy2DAsync(h, hpitch, d, dpitch, width, (size_t) HKV, cudaMemcpyDeviceToHost, st));
             else CK(cudaMemcpy2DAsync(d, dpitch, h, hpitch, width, (size_t) HKV, cudaMemcpyHostToDevice, st));
             h += hpitch * (size_t) HKV;
         };
-        auto store = [&](float* d, bool i8) {
+        auto store = [&](float* d, bool i8, bool i4) {
             if (!i8) {
                 cp2(d, (size_t) ctx * HD * 4, (size_t) cap * HD * 4, (size_t) n * HD * 4);
                 return;
             }
-            cp2(d, (size_t) ctx * HD, (size_t) cap * HD, (size_t) n * HD);
-            cp2(kv8_scales(d, HKV, ctx, HD), (size_t) ctx * ng * 2, (size_t) cap * ng * 2, (size_t) n * ng * 2);
+            const size_t cb = kv_cell_codes(true, i4), sb = kv_cell_scales(true, i4);   // bytes per cell of a KV head
+            cp2(d, (size_t) ctx * cb, (size_t) cap * cb, (size_t) n * cb);
+            cp2(i4 ? (void*) kv4_scales(d, HKV, ctx, HD) : (void*) kv8_scales(d, HKV, ctx, HD), (size_t) ctx * sb,
+                (size_t) cap * sb, (size_t) n * sb);
         };
         for (size_t l = 0; l < kc.size(); ++l)
-            if (kc[l]) { store(kc[l], kv_k8); store(vc[l], kv_v8); }
+            if (kc[l]) { store(kc[l], kv_k8, false); store(vc[l], kv_v8, kv_v4); }
         CK(cudaStreamSynchronize(st));
     }
     /// The current session's state after its first n cells becomes its checkpoint.
@@ -5032,7 +5169,7 @@ int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file, kv_opt;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
-    bool warm = true, kv_k8 = false, kv_v8 = false;
+    bool warm = true, kv_k8 = false, kv_v8 = false, kv_v4 = false;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
@@ -5101,18 +5238,20 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (kv == "int8" || kv == "k8v8") kv_k8 = kv_v8 = true;
         else if (kv == "k8v32") kv_k8 = true;
         else if (kv == "k32v8") kv_v8 = true;
+        else if (kv == "k8v4") kv_k8 = kv_v8 = kv_v4 = true;   // int8 K, 4-bit V (+ the rotation unless STRATA_Q36_V4_ROT=0)
         else if (serve_mode) {
             // serve passes the config's args: a Flash-Next value (fp16, q4_0, k8v4) was skipped before --kv existed
             // here, and still is (both stores FP32)
-            std::fprintf(stderr, "strata-q36: ignoring --kv %s (this engine's stores: fp32, int8, k8v8, k8v32, k32v8)\n",
+            std::fprintf(stderr, "strata-q36: ignoring --kv %s (this engine's stores: fp32, int8, k8v8, k8v32, k32v8, k8v4)\n",
                          kv.c_str());
         } else {
-            std::fprintf(stderr, "strata-q36: --kv must be fp32, int8, k8v8, k8v32 or k32v8 (q4_0 and k8v4 are PR "
-                                 "#21's rotation kernels: not in this engine)\n");
+            std::fprintf(stderr, "strata-q36: --kv must be fp32, int8, k8v8, k8v32, k32v8 or k8v4 (q4_0 is PR "
+                                 "#21's rotation kernel: not in this engine)\n");
             return 2;
         }
         if (kv_k8 || kv_v8)
-            std::fprintf(stderr, "strata-q36: KV cache: K %s, V %s\n", kv_k8 ? "int8" : "fp32", kv_v8 ? "int8" : "fp32");
+            std::fprintf(stderr, "strata-q36: KV cache: K %s, V %s\n", kv_k8 ? "int8" : "fp32",
+                         kv_v4 ? "4-bit" : kv_v8 ? "int8" : "fp32");
     }
     if (model.empty()) { std::fprintf(stderr, "strata-q36: --model is required\n"); return 2; }
 #if !defined(_WIN32)
@@ -5137,6 +5276,8 @@ int strata::qwen35::run(int argc, char** argv) {
     Engine E;
     E.kv_k8 = kv_k8;
     E.kv_v8 = kv_v8;
+    E.kv_v4 = kv_v4;
+    if (const char* r = std::getenv("STRATA_Q36_V4_ROT")) E.kv_v4_rot = std::atoi(r) != 0;
     E.use_graph = graph;
     E.packed_droppable = expert_slots <= 0 && expert_vram < 0 && std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr;
     if (chunk == 0) {
@@ -5167,7 +5308,7 @@ int strata::qwen35::run(int argc, char** argv) {
             double kv_one = 45056.0;
             double kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
             if (kv_k8 || kv_v8) {   // --kv: an int8 store takes 1 + 2 / kKVG bytes per value instead of 4
-                kv_one *= ((kv_k8 ? 1.03125 / 4.0 : 1.0) + (kv_v8 ? 1.03125 / 4.0 : 1.0)) / 2.0;
+                kv_one *= ((kv_k8 ? 1.03125 / 4.0 : 1.0) + (kv_v4 ? 0.5625 / 4.0 : kv_v8 ? 1.03125 / 4.0 : 1.0)) / 2.0;
                 // the FP16 copies (none past a block: Engine::kv16_blk) and the split-K partials (kGemmT rows instead of 64)
                 const auto& g = m.g;
                 kv_shared = (Engine::kv16_block_cells(true, ctx) > 0 ? 0.0 : (double) (g.n_head_kv * g.head_dim * 2 * 2)) +
