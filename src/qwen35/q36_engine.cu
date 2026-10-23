@@ -27,6 +27,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "q36_kernels.cuh"
+#include "q36_sampling.h"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -3968,51 +3969,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 }
 
 // ------------------------------------------------------------------------------------------------ sampling
-struct Sampling {
-    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
-    int top_k = 20, last_n = 0;
-    unsigned long long seed = 0;
-    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
-};
-
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
-        std::map<int, int> cnt;
-        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
-        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [id, c] : cnt) {
-            float& v = lg[(size_t) id];
-            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
-            v -= (float) c * s.freq + s.present;
-        }
-    }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
-    double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
-    size_t keep = idx.size();
-    double cum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
-        cum += p[i] / sum;
-        if (cum >= s.top_p) { keep = i + 1; break; }
-    }
-    keep = std::max<size_t>(1, keep);
-    double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
-    std::uniform_real_distribution<double> u(0.0, tot);
-    double r = u(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        if ((r -= p[i]) <= 0) return idx[i];
-    }
-    return idx[keep - 1];
-}
+using strata::q36_sampling::Dist;
+using strata::q36_sampling::Sampling;
+using strata::q36_sampling::sample;
+using strata::q36_sampling::spec_row;
 
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
@@ -4809,7 +4769,14 @@ struct Serve {
         static const bool pen_spec_env = std::getenv("STRATA_Q36_PENALTY_SPEC") != nullptr &&
                                          std::string(std::getenv("STRATA_Q36_PENALTY_SPEC")) != "0";
         const bool pen_spec = pen_spec_env && smp.needs_logits() && smp.temperature <= 0.f;
-        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || pen_spec) && !adm;
+        // opt-in (STRATA_Q36_SPEC_SAMPLE=1): sampled requests (temperature > 0) take the speculative steps too, as exact
+        // speculative sampling: draft i is accepted with the probability the sampler gives it at its row, a rejection draws
+        // the replacement from that row's distribution without the draft (spec_row), so the text is distributed as one
+        // token at a time (not the same tokens for a seed: the draws differ)
+        static const bool spec_sample_env = std::getenv("STRATA_Q36_SPEC_SAMPLE") != nullptr &&
+                                            std::string(std::getenv("STRATA_Q36_SPEC_SAMPLE")) != "0";
+        const bool samp_spec = spec_sample_env && smp.temperature > 0.f;
+        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || pen_spec || samp_spec) && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         bool decided = false;   // nx came from a speculative step's (penalized) row: not sampled again at the loop's top
@@ -4818,6 +4785,19 @@ struct Serve {
             std::vector<int32_t> h = hist;   // hist ends with x; row r follows drafts 0 .. r - 1 too
             for (int i = 0; i < r; ++i) h.push_back(drafts[(size_t) i]);
             return (int32_t) sample(lg, smp, h, rng);
+        };
+        Dist spec_dist;
+        std::vector<int32_t> spec_h;
+        // sampled: row r is (accepted draft r, or its replacement) for r < D, the bonus token for r == D; a row's token
+        // equals its draft exactly when the draft is accepted, which is what spec_step's loop tests
+        const std::function<int32_t(int)> repick_s = [&](int r) -> int32_t {
+            if (r == 0) {   // hist ends with x; row r follows drafts 0 .. r - 1 too
+                spec_h = hist;
+                spec_h.insert(spec_h.end(), drafts.begin(), drafts.end());
+            }
+            E.host_logits_row(r, lg);
+            return (int32_t) spec_row(lg, smp, spec_h.data(), hist.size() + (size_t) r,
+                                      r < (int) drafts.size() ? drafts[(size_t) r] : -1, rng, spec_dist);
         };
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
@@ -4873,7 +4853,8 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, pen_spec ? &repick : nullptr);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop,
+                                          samp_spec ? &repick_s : pen_spec ? &repick : nullptr);
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
